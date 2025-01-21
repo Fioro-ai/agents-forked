@@ -153,9 +153,7 @@ class LLM(llm.LLM):
 
         latest_system_message = _latest_system_message(chat_ctx)
         anthropic_ctx = _build_anthropic_context(chat_ctx.messages, id(self))
-        collapsed_anthropic_ctx = _merge_messages(anthropic_ctx)
-        logger.info(f"chat-messages  {collapsed_anthropic_ctx}")
-    
+        collapsed_anthropic_ctx = _merge_messages(anthropic_ctx)    
         stream = self._client.messages.create(
             max_tokens=opts.get("max_tokens", 1024),
             system=latest_system_message,
@@ -405,7 +403,7 @@ def _build_anthropic_message(
                 anthropic.types.TextBlockParam(
                     text=msg.content,
                     type="text",
-                    cache_control=anthropic.types.CacheControlEphemeralParam() if ephemeral else anthropic.NOT_GIVEN
+                    cache_control=anthropic.types.CacheControlEphemeralParam(type="ephemeral") if ephemeral else None
                 )
             )
         elif isinstance(msg.content, list):
@@ -415,7 +413,7 @@ def _build_anthropic_message(
                         anthropic.types.TextBlockParam(
                             text=cnt,
                             type="text",
-                            cache_control=anthropic.types.CacheControlEphemeralParam() if ephemeral else anthropic.NOT_GIVEN
+                            cache_control=anthropic.types.CacheControlEphemeralParam(type="ephemeral") if ephemeral else None
                         )
                     )
                 elif isinstance(cnt, llm.ChatImage):
