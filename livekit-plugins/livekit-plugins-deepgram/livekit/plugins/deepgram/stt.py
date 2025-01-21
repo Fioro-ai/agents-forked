@@ -105,10 +105,9 @@ class STTOptions:
     num_channels: int
     keywords: list[Tuple[str, float]]
     profanity_filter: bool
-    energy_filter: AudioEnergyFilter | bool = False
-    # custom
     replace: list[str]
     mip_opt_out: bool
+    energy_filter: AudioEnergyFilter | bool = False
 
 class STT(stt.STT):
     def __init__(
@@ -130,9 +129,9 @@ class STT(stt.STT):
         api_key: str | None = None,
         http_session: aiohttp.ClientSession | None = None,
         base_url: str = BASE_URL,
-        energy_filter: AudioEnergyFilter | bool = False,
         replace: list[str] = [],
         mip_opt_out: bool = False,
+        energy_filter: AudioEnergyFilter | bool = False,
     ) -> None:
         """
         Create a new instance of Deepgram STT.
@@ -170,9 +169,9 @@ class STT(stt.STT):
             num_channels=1,
             keywords=keywords,
             profanity_filter=profanity_filter,
-            energy_filter=energy_filter,
             replace=replace,
             mip_opt_out=mip_opt_out,
+            energy_filter=energy_filter,
         )
         self._session = http_session
         self._streams = weakref.WeakSet[SpeechStream]()
