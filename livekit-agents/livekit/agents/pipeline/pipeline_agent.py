@@ -310,6 +310,13 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
         self._last_final_transcript_time: float | None = None
         self._last_speech_time: float | None = None
 
+        # custom
+        self._is_agent_speaking: bool = False
+        self.llm_stream_begun: bool = False
+
+        # Register event handler
+        self.llm.on("llm_stream_begun", lambda: asyncio.create_task(self._on_llm_stream_begun()))
+
     @property
     def fnc_ctx(self) -> FunctionContext | None:
         return self._fnc_ctx
@@ -531,6 +538,11 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
 
         self._update_state_task = asyncio.create_task(_run_task(delay))
 
+    async def _on_llm_stream_begun(self) -> None:
+        """Handler called when LLM stream begins."""
+        self.llm_stream_begun = True
+       
+
     async def aclose(self) -> None:
         """Close the voice assistant"""
         if not self._started:
@@ -565,6 +577,8 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
             self._deferred_validation.on_human_start_of_speech(ev)
 
         def _on_vad_inference_done(ev: vad.VADEvent) -> None:
+
+
             if not self._track_published_fut.done():
                 return
 
@@ -638,6 +652,7 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
         self._human_input.on("interim_transcript", _on_interim_transcript)
         self._human_input.on("final_transcript", _on_final_transcript)
 
+
     @utils.log_exceptions(logger=logger)
     async def _main_task(self) -> None:
         if self._opts.plotting:
@@ -662,11 +677,17 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
             self._plotter.plot_event("agent_started_speaking")
             self.emit("agent_started_speaking")
             self._update_state("speaking")
+            self._is_agent_speaking = True
+
 
         def _on_playout_stopped(interrupted: bool) -> None:
             self._plotter.plot_event("agent_stopped_speaking")
             self.emit("agent_stopped_speaking")
             self._update_state("listening")
+            self._is_agent_speaking = False
+            self.llm_stream_begun = False
+            
+
 
         agent_playout.on("playout_started", _on_playout_started)
         agent_playout.on("playout_stopped", _on_playout_stopped)
@@ -693,6 +714,7 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
             self._pending_agent_reply.cancel()
 
         if self._human_input is not None and not self._human_input.speaking:
+
             self._update_state("thinking", 0.2)
 
         self._pending_agent_reply = new_handle = SpeechHandle.create_assistant_reply(
@@ -737,12 +759,14 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
                     )
                 )
 
-        # we want to add this question even if it's empty. during false positive interruptions,
-        # adding an empty user message gives the LLM context so it could continue from where
-        # it had been interrupted.
-        copied_ctx.messages.append(
-            ChatMessage.create(text=handle.user_question, role="user")
-        )
+        # when user_question is empty, it's due to a false positive interruption
+        # when this happens, we'd want to add a continue marker to the chat context.
+        # while some LLMs could deal with empty content during an inference request
+        # others would fail.
+        user_input = handle.user_question
+        if not user_input.strip():
+            user_input = "<continue>"
+        copied_ctx.messages.append(ChatMessage.create(text=user_input, role="user"))
 
         tk = SpeechDataContextVar.set(SpeechData(sequence_id=handle.id))
         try:
@@ -1173,6 +1197,14 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
 
     def _should_interrupt(self) -> bool:
         if self._playing_speech is None:
+            return False
+        
+        # custom when the agent is actually speaking do not interrupt
+        if self._is_agent_speaking:
+            return False
+
+        # custom when the LLM stream has begun do not interrupt
+        if self.llm_stream_begun:
             return False
 
         if (

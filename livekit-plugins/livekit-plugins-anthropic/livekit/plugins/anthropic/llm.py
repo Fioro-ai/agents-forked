@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from __future__ import annotations
-
+from datetime import datetime
 import base64
 import inspect
 import json
@@ -153,7 +153,11 @@ class LLM(llm.LLM):
 
         latest_system_message = _latest_system_message(chat_ctx)
         anthropic_ctx = _build_anthropic_context(chat_ctx.messages, id(self))
-        collapsed_anthropic_ctx = _merge_messages(anthropic_ctx)    
+        collapsed_anthropic_ctx = _merge_messages(anthropic_ctx)   
+        
+        # custom
+        logger.info("calling anthropic ", datetime.now())
+
         stream = self._client.messages.create(
             max_tokens=opts.get("max_tokens", 1024),
             system=latest_system_message,
@@ -246,6 +250,8 @@ class LLMStream(llm.LLMStream):
             self._request_id = event.message.id
             self._input_tokens = event.message.usage.input_tokens
             self._output_tokens = event.message.usage.output_tokens
+            # custom
+            self._llm.emit("llm_stream_begun")
         elif event.type == "message_delta":
             self._output_tokens += event.usage.output_tokens
         elif event.type == "content_block_start":
