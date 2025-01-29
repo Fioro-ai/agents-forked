@@ -621,7 +621,7 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
                 extra={"user_transcript": new_transcript},
             )
 
-            print("received user transcript: ", new_transcript)
+            logger.info(f"received user transcript: {new_transcript}")
 
             self._last_final_transcript_time = time.perf_counter()
 
@@ -680,7 +680,7 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
             self.emit("agent_started_speaking")
             self._update_state("speaking")
             self._is_agent_speaking = True
-            print("agent started speaking")
+            logger.info("agent started speaking")
 
 
         def _on_playout_stopped(interrupted: bool) -> None:
@@ -689,7 +689,7 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
             self._update_state("listening")
             self._is_agent_speaking = False
             self.llm_stream_begun = False
-            print("agent stopped speaking")
+            logger.info("agent stopped speaking")
             
 
 
@@ -1222,8 +1222,8 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
             interim_words = self._opts.transcription.word_tokenizer.tokenize(text=text)
             if len(interim_words) < self._opts.int_min_words:
                 return False
-            
-        print("interrupted")
+        
+        logger.info("interrupting")
         return True
 
     def _add_speech_for_playout(self, speech_handle: SpeechHandle) -> None:
