@@ -201,6 +201,7 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
         loop: asyncio.AbstractEventLoop | None = None,
         # backward compatibility
         will_synthesize_assistant_reply: WillSynthesizeAssistantReply | None = None,
+        mode: Literal["auto", "manual"] = "auto",
     ) -> None:
         """
         Create a new VoicePipelineAgent.
@@ -313,6 +314,8 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
         # custom
         self._is_agent_speaking: bool = False
         self.llm_stream_begun: bool = False
+        self.mode: Literal["auto", "manual"] = mode
+        self.hold_back_counterpart = False
 
         # Register event handler
         self.llm.on("llm_stream_begun", lambda: asyncio.create_task(self._on_llm_stream_begun()))
@@ -415,6 +418,10 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
                 break
 
         self._main_atask = asyncio.create_task(self._main_task())
+
+    # custom    
+    def let_speak(self):
+        self.hold_back_counterpart = False
 
     def on(self, event: EventTypes, callback: Callable[[Any], None] | None = None):
         """Register a callback for an event
@@ -577,8 +584,6 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
             self._deferred_validation.on_human_start_of_speech(ev)
 
         def _on_vad_inference_done(ev: vad.VADEvent) -> None:
-
-
             if not self._track_published_fut.done():
                 return
 
@@ -690,8 +695,11 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
             self._is_agent_speaking = False
             self.llm_stream_begun = False
             logger.info("agent stopped speaking")
-            
 
+            # in the manual mode, we want to counterpart to hold back until the user commits his message
+            if self.mode == "manual":
+                self.hold_back_counterpart = True
+            
 
         agent_playout.on("playout_started", _on_playout_started)
         agent_playout.on("playout_stopped", _on_playout_stopped)
@@ -713,6 +721,8 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
     def _synthesize_agent_reply(self):
         """Synthesize the agent reply to the user question, also make sure only one reply
         is synthesized/played at a time"""
+
+
 
         if self._pending_agent_reply is not None:
             self._pending_agent_reply.cancel()
@@ -1126,6 +1136,11 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
 
     def _validate_reply_if_possible(self) -> None:
         """Check if the new agent speech should be played"""
+
+        # custom - do not let counterpart speak
+        if self.mode == "manual" and self.hold_back_counterpart:
+            return
+
 
         if self._playing_speech and not self._playing_speech.interrupted:
             should_ignore_input = False
