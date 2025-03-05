@@ -155,9 +155,6 @@ class LLM(llm.LLM):
         anthropic_ctx = _build_anthropic_context(chat_ctx.messages, id(self))
         collapsed_anthropic_ctx = _merge_messages(anthropic_ctx)   
         
-        # custom
-        logger.info("calling anthropic")
-
         stream = self._client.messages.create(
             max_tokens=opts.get("max_tokens", 1024),
             system=latest_system_message,
