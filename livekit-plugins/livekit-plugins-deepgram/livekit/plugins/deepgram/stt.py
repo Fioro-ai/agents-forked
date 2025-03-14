@@ -106,8 +106,9 @@ class STTOptions:
     keywords: list[Tuple[str, float]]
     keyterms: list[str]
     profanity_filter: bool
+    replace: list[str]
+    mip_opt_out: bool
     energy_filter: AudioEnergyFilter | bool = False
-
 
 class STT(stt.STT):
     def __init__(
@@ -130,6 +131,8 @@ class STT(stt.STT):
         api_key: str | None = None,
         http_session: aiohttp.ClientSession | None = None,
         base_url: str = BASE_URL,
+        replace: list[str] = [],
+        mip_opt_out: bool = False,
         energy_filter: AudioEnergyFilter | bool = False,
     ) -> None:
         """Create a new instance of Deepgram STT.
@@ -195,6 +198,8 @@ class STT(stt.STT):
             keywords=keywords or [],
             keyterms=keyterms or [],
             profanity_filter=profanity_filter,
+            replace=replace,
+            mip_opt_out=mip_opt_out,
             energy_filter=energy_filter,
         )
         self._session = http_session
@@ -222,6 +227,9 @@ class STT(stt.STT):
             "smart_format": config.smart_format,
             "keywords": self._opts.keywords,
             "profanity_filter": config.profanity_filter,
+            # custom
+            "replace": self._opts.replace,
+            "mip_opt_out": self._opts.mip_opt_out,
         }
         if config.language:
             recognize_config["language"] = config.language
@@ -290,6 +298,9 @@ class STT(stt.STT):
         keywords: list[Tuple[str, float]] | None = None,
         keyterms: list[str] | None = None,
         profanity_filter: bool | None = None,
+        # custom
+        replace: list[str] | None = None,
+        mip_opt_out: bool | None = None,
     ):
         if language is not None:
             self._opts.language = language
@@ -315,6 +326,12 @@ class STT(stt.STT):
             self._opts.keyterms = keyterms
         if profanity_filter is not None:
             self._opts.profanity_filter = profanity_filter
+        # custom
+        if replace is not None:
+            self._opts.replace = replace
+        if mip_opt_out is not None:
+            self._opts.mip_opt_out = mip_opt_out
+
 
         for stream in self._streams:
             stream.update_options(
@@ -330,6 +347,9 @@ class STT(stt.STT):
                 keywords=keywords,
                 keyterms=keyterms,
                 profanity_filter=profanity_filter,
+                # custom
+                replace=replace,
+                mip_opt_out=mip_opt_out,
             )
 
     def _sanitize_options(self, *, language: str | None = None) -> STTOptions:
@@ -400,6 +420,9 @@ class SpeechStream(stt.SpeechStream):
         keywords: list[Tuple[str, float]] | None = None,
         keyterms: list[str] | None = None,
         profanity_filter: bool | None = None,
+        # custom
+        replace: list[str] | None = None,
+        mip_opt_out: bool | None = None,
     ):
         if language is not None:
             self._opts.language = language
@@ -425,6 +448,11 @@ class SpeechStream(stt.SpeechStream):
             self._opts.keyterms = keyterms
         if profanity_filter is not None:
             self._opts.profanity_filter = profanity_filter
+        # custom
+        if replace is not None:
+            self._opts.replace = replace
+        if mip_opt_out is not None:
+            self._opts.mip_opt_out = mip_opt_out
 
         self._reconnect_event.set()
 
@@ -570,6 +598,9 @@ class SpeechStream(stt.SpeechStream):
             else self._opts.endpointing_ms,
             "filler_words": self._opts.filler_words,
             "profanity_filter": self._opts.profanity_filter,
+            # custom
+            "replace": self._opts.replace,
+            "mip_opt_out": self._opts.mip_opt_out,
         }
         if self._opts.keywords:
             live_config["keywords"] = self._opts.keywords

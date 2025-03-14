@@ -202,6 +202,7 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
         loop: asyncio.AbstractEventLoop | None = None,
         # backward compatibility
         will_synthesize_assistant_reply: WillSynthesizeAssistantReply | None = None,
+        mode: Literal["auto", "manual"] = "auto",
     ) -> None:
         """
         Create a new VoicePipelineAgent.
@@ -311,6 +312,14 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
         self._last_final_transcript_time: float | None = None
         self._last_speech_time: float | None = None
 
+        # custom
+        self._is_agent_speaking: bool = False
+        self.llm_stream_begun: bool = False
+        self.mode: Literal["auto", "manual"] = mode
+        self.hold_back_counterpart = False
+
+        # Register event handler
+        self.llm.on("llm_stream_begun", lambda: asyncio.create_task(self._on_llm_stream_begun()))
         self._noise_cancellation = noise_cancellation
 
     @property
@@ -411,6 +420,10 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
                 break
 
         self._main_atask = asyncio.create_task(self._main_task())
+
+    # custom    
+    def let_speak(self):
+        self.hold_back_counterpart = False
 
     def on(self, event: EventTypes, callback: Callable[[Any], None] | None = None):
         """Register a callback for an event
@@ -536,6 +549,11 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
 
         self._update_state_task = asyncio.create_task(_run_task(delay))
 
+    async def _on_llm_stream_begun(self) -> None:
+        """Handler called when LLM stream begins."""
+        self.llm_stream_begun = True
+       
+
     async def aclose(self) -> None:
         """Close the voice assistant"""
         if not self._started:
@@ -644,6 +662,7 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
         self._human_input.on("interim_transcript", _on_interim_transcript)
         self._human_input.on("final_transcript", _on_final_transcript)
 
+
     @utils.log_exceptions(logger=logger)
     async def _main_task(self) -> None:
         if self._opts.plotting:
@@ -668,11 +687,20 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
             self._plotter.plot_event("agent_started_speaking")
             self.emit("agent_started_speaking")
             self._update_state("speaking")
+            self._is_agent_speaking = True
+
 
         def _on_playout_stopped(interrupted: bool) -> None:
             self._plotter.plot_event("agent_stopped_speaking")
             self.emit("agent_stopped_speaking")
             self._update_state("listening")
+            self._is_agent_speaking = False
+            self.llm_stream_begun = False
+
+            # in the manual mode, we want to counterpart to hold back until the user commits his message
+            if self.mode == "manual":
+                self.hold_back_counterpart = True
+            
 
         agent_playout.on("playout_started", _on_playout_started)
         agent_playout.on("playout_stopped", _on_playout_stopped)
@@ -695,10 +723,13 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
         """Synthesize the agent reply to the user question, also make sure only one reply
         is synthesized/played at a time"""
 
+
+
         if self._pending_agent_reply is not None:
             self._pending_agent_reply.cancel()
 
         if self._human_input is not None and not self._human_input.speaking:
+
             self._update_state("thinking", 0.2)
 
         self._pending_agent_reply = new_handle = SpeechHandle.create_assistant_reply(
@@ -1147,6 +1178,11 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
     def _validate_reply_if_possible(self) -> None:
         """Check if the new agent speech should be played"""
 
+        # custom - do not let counterpart speak
+        if self.mode == "manual" and self.hold_back_counterpart:
+            return
+
+
         if self._playing_speech and not self._playing_speech.interrupted:
             should_ignore_input = False
             if not self._playing_speech.allow_interruptions:
@@ -1222,6 +1258,14 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
     def _should_interrupt(self) -> bool:
         if self._playing_speech is None:
             return False
+        
+        # custom when the agent is actually speaking do not interrupt
+        if self._is_agent_speaking:
+            return False
+
+        # custom when the LLM stream has begun do not interrupt
+        if self.llm_stream_begun:
+            return False
 
         if (
             not self._playing_speech.allow_interruptions
@@ -1234,7 +1278,7 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
             interim_words = self._opts.transcription.word_tokenizer.tokenize(text=text)
             if len(interim_words) < self._opts.int_min_words:
                 return False
-
+        
         return True
 
     def _add_speech_for_playout(self, speech_handle: SpeechHandle) -> None:

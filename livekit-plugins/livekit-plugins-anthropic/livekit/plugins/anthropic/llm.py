@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from __future__ import annotations
-
+from datetime import datetime
 import base64
 import inspect
 import json
@@ -189,29 +189,24 @@ class LLM(llm.LLM):
                     anthropic_tool_choice["disable_parallel_tool_use"] = True
                 opts["tool_choice"] = anthropic_tool_choice
 
-        latest_system_message: anthropic.types.TextBlockParam | None = (
-            _latest_system_message(chat_ctx, caching=self._opts.caching)
-        )
+        latest_system_message = _latest_system_message(chat_ctx)
         if latest_system_message:
             opts["system"] = [latest_system_message]
 
-        anthropic_ctx = _build_anthropic_context(
-            chat_ctx.messages,
-            id(self),
-            caching=self._opts.caching,
-        )
-        collaped_anthropic_ctx = _merge_messages(anthropic_ctx)
-
+        # custom
+        anthropic_ctx = _build_anthropic_context(chat_ctx.messages, id(self))
+        collapsed_anthropic_ctx = _merge_messages(anthropic_ctx)   
+        
         stream = self._client.messages.create(
             max_tokens=opts.get("max_tokens", 1024),
-            messages=collaped_anthropic_ctx,
-            model=self._opts.model,
+            messages=collapsed_anthropic_ctx,
+              model=self._opts.model,
             temperature=temperature or anthropic.NOT_GIVEN,
             top_k=n or anthropic.NOT_GIVEN,
             stream=True,
             **opts,
         )
-
+        
         return LLMStream(
             self,
             anthropic_stream=stream,
@@ -300,6 +295,9 @@ class LLMStream(llm.LLMStream):
             self._request_id = event.message.id
             self._input_tokens = event.message.usage.input_tokens
             self._output_tokens = event.message.usage.output_tokens
+            # custom
+            self._llm.emit("llm_stream_begun")
+            # normal
             if event.message.usage.cache_creation_input_tokens:
                 self._cache_creation_tokens = (
                     event.message.usage.cache_creation_input_tokens
@@ -370,9 +368,7 @@ class LLMStream(llm.LLMStream):
         return None
 
 
-def _latest_system_message(
-    chat_ctx: llm.ChatContext, caching: Literal["ephemeral"] | None = None
-) -> anthropic.types.TextBlockParam | None:
+def _latest_system_message(chat_ctx: llm.ChatContext) -> str:
     latest_system_message: llm.ChatMessage | None = None
     for m in chat_ctx.messages:
         if m.role == "system":
@@ -387,14 +383,8 @@ def _latest_system_message(
             latest_system_str = " ".join(
                 [c for c in latest_system_message.content if isinstance(c, str)]
             )
-    if latest_system_str:
-        system_text_block = anthropic.types.TextBlockParam(
-            text=latest_system_str,
-            type="text",
-            cache_control=CACHE_CONTROL_EPHEMERAL if caching == "ephemeral" else None,
-        )
-        return system_text_block
-    return None
+    
+    return latest_system_str
 
 
 def _merge_messages(
@@ -423,30 +413,40 @@ def _merge_messages(
     return combined_messages
 
 
-def _build_anthropic_context(
-    chat_ctx: List[llm.ChatMessage],
-    cache_key: Any,
-    caching: Literal["ephemeral"] | None,
-) -> List[anthropic.types.MessageParam]:
+def _build_anthropic_context(chat_ctx: List[llm.ChatMessage], cache_key: Any) -> List[anthropic.types.MessageParam]:
+    ephemeral_count = 0
+    ephemeral_char_count = 0
+    ephemeral_max_count = 4
+    user_msg_index = 0
     result: List[anthropic.types.MessageParam] = []
-    for i, msg in enumerate(chat_ctx):
-        # caching last message will cache whole chat history if caching is enabled
-        cache_ctrl = (
-            CACHE_CONTROL_EPHEMERAL
-            if ((i == len(chat_ctx) - 1) and caching == "ephemeral")
-            else None
-        )
-        a_msg = _build_anthropic_message(msg, cache_key, cache_ctrl=cache_ctrl)
 
+    for msg in chat_ctx:
+        ephemeral = False
+        if isinstance(msg.content, str):
+            ephemeral_char_count += len(msg.content)
+        elif isinstance(msg.content, list):
+            ephemeral_char_count += sum(len(c) for c in msg.content if isinstance(c, str))
+
+
+        if msg.role == "user" and ephemeral_count < ephemeral_max_count:
+            user_msg_index += 1
+            if ephemeral_count == 0 and user_msg_index == 2:
+                ephemeral = True
+                ephemeral_count += 1
+                ephemeral_char_count = 0
+            elif ephemeral_count > 0 and ephemeral_char_count >= 4200:
+                ephemeral = True
+                ephemeral_count += 1
+                ephemeral_char_count = 0
+
+        a_msg = _build_anthropic_message(msg, cache_key, chat_ctx, ephemeral)
         if a_msg:
             result.append(a_msg)
+
     return result
 
-
 def _build_anthropic_message(
-    msg: llm.ChatMessage,
-    cache_key: Any,
-    cache_ctrl: anthropic.types.CacheControlEphemeralParam | None,
+    msg: llm.ChatMessage, cache_key: Any, chat_ctx: List[llm.ChatMessage], ephemeral: bool = False
 ) -> anthropic.types.MessageParam | None:
     if msg.role == "user" or msg.role == "assistant":
         a_msg: anthropic.types.MessageParam = {
@@ -462,20 +462,19 @@ def _build_anthropic_message(
                 anthropic.types.TextBlockParam(
                     text=msg.content,
                     type="text",
-                    cache_control=cache_ctrl,
+                    cache_control=anthropic.types.CacheControlEphemeralParam(type="ephemeral") if ephemeral else None
                 )
             )
         elif isinstance(msg.content, list):
             for cnt in msg.content:
                 if isinstance(cnt, str) and cnt:
-                    content: anthropic.types.TextBlockParam = (
+                    a_content.append(
                         anthropic.types.TextBlockParam(
                             text=cnt,
                             type="text",
-                            cache_control=cache_ctrl,
+                            cache_control=anthropic.types.CacheControlEphemeralParam(type="ephemeral") if ephemeral else None
                         )
                     )
-                    a_content.append(content)
                 elif isinstance(cnt, llm.ChatImage):
                     a_content.append(
                         _build_anthropic_image_content(cnt, cache_key, cache_ctrl)
