@@ -39,7 +39,7 @@ from livekit.agents import (
     llm,
     utils,
 )
-from livekit.agents.llm import ToolChoice
+from livekit.agents.llm import LLMCapabilities, ToolChoice
 from livekit.agents.llm.function_context import (
     _create_ai_function_info,
     _is_optional_type,
@@ -53,6 +53,8 @@ from .models import (
     ChatModels,
 )
 
+CACHE_CONTROL_EPHEMERAL = anthropic.types.CacheControlEphemeralParam(type="ephemeral")
+
 
 @dataclass
 class LLMOptions:
@@ -61,6 +63,8 @@ class LLMOptions:
     temperature: float | None
     parallel_tool_calls: bool | None
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] | None
+    caching: Literal["ephemeral"] | None = None
+    """If set to "ephemeral", the system prompt, tools, and chat history will be cached."""
 
 
 class LLM(llm.LLM):
@@ -75,14 +79,31 @@ class LLM(llm.LLM):
         temperature: float | None = None,
         parallel_tool_calls: bool | None = None,
         tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = "auto",
+        caching: Literal["ephemeral"] | None = None,
     ) -> None:
         """
         Create a new instance of Anthropic LLM.
 
         ``api_key`` must be set to your Anthropic API key, either using the argument or by setting
         the ``ANTHROPIC_API_KEY`` environmental variable.
+
+        model (str | ChatModels): The model to use. Defaults to "claude-3-5-sonnet-20241022".
+        api_key (str | None): The Anthropic API key. Defaults to the ANTHROPIC_API_KEY environment variable.
+        base_url (str | None): The base URL for the Anthropic API. Defaults to None.
+        user (str | None): The user for the Anthropic API. Defaults to None.
+        client (anthropic.AsyncClient | None): The Anthropic client to use. Defaults to None.
+        temperature (float | None): The temperature for the Anthropic API. Defaults to None.
+        parallel_tool_calls (bool | None): Whether to parallelize tool calls. Defaults to None.
+        tool_choice (Union[ToolChoice, Literal["auto", "required", "none"]] | None): The tool choice for the Anthropic API. Defaults to "auto".
+        caching (Literal["ephemeral"] | None): If set to "ephemeral", caching will be enabled for the system prompt, tools, and chat history.
         """
-        super().__init__()
+
+        super().__init__(
+            capabilities=LLMCapabilities(
+                requires_persistent_functions=True,
+                supports_choices_on_int=True,
+            )
+        )
 
         # throw an error on our end
         api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
@@ -95,6 +116,7 @@ class LLM(llm.LLM):
             temperature=temperature,
             parallel_tool_calls=parallel_tool_calls,
             tool_choice=tool_choice,
+            caching=caching,
         )
         self._client = client or anthropic.AsyncClient(
             api_key=api_key,
@@ -132,12 +154,24 @@ class LLM(llm.LLM):
         opts: dict[str, Any] = dict()
         if fnc_ctx and len(fnc_ctx.ai_functions) > 0:
             fncs_desc: list[anthropic.types.ToolParam] = []
-            for fnc in fnc_ctx.ai_functions.values():
-                fncs_desc.append(_build_function_description(fnc))
+            for i, fnc in enumerate(fnc_ctx.ai_functions.values()):
+                # caching last tool will cache all the tools if caching is enabled
+                cache_ctrl = (
+                    CACHE_CONTROL_EPHEMERAL
+                    if (i == len(fnc_ctx.ai_functions) - 1)
+                    and self._opts.caching == "ephemeral"
+                    else None
+                )
+                fncs_desc.append(
+                    _build_function_description(
+                        fnc,
+                        cache_ctrl=cache_ctrl,
+                    )
+                )
 
             opts["tools"] = fncs_desc
             if tool_choice is not None:
-                anthropic_tool_choice: dict[str, Any] = {"type": "auto"}
+                anthropic_tool_choice: dict[str, Any] | None = {"type": "auto"}
                 if isinstance(tool_choice, ToolChoice):
                     if tool_choice.type == "function":
                         anthropic_tool_choice = {
@@ -147,25 +181,32 @@ class LLM(llm.LLM):
                 elif isinstance(tool_choice, str):
                     if tool_choice == "required":
                         anthropic_tool_choice = {"type": "any"}
-            if parallel_tool_calls is not None and parallel_tool_calls is False:
-                anthropic_tool_choice["disable_parallel_tool_use"] = True
-            opts["tool_choice"] = anthropic_tool_choice
+                    elif tool_choice == "none":
+                        opts["tools"] = []
+                        anthropic_tool_choice = None
+            if anthropic_tool_choice is not None:
+                if parallel_tool_calls is False:
+                    anthropic_tool_choice["disable_parallel_tool_use"] = True
+                opts["tool_choice"] = anthropic_tool_choice
 
         latest_system_message = _latest_system_message(chat_ctx)
+        if latest_system_message:
+            opts["system"] = [latest_system_message]
+
+        # custom
         anthropic_ctx = _build_anthropic_context(chat_ctx.messages, id(self))
         collapsed_anthropic_ctx = _merge_messages(anthropic_ctx)   
         
         stream = self._client.messages.create(
             max_tokens=opts.get("max_tokens", 1024),
-            system=latest_system_message,
             messages=collapsed_anthropic_ctx,
-            model=self._opts.model,
+              model=self._opts.model,
             temperature=temperature or anthropic.NOT_GIVEN,
             top_k=n or anthropic.NOT_GIVEN,
             stream=True,
             **opts,
         )
-
+        
         return LLMStream(
             self,
             anthropic_stream=stream,
@@ -203,6 +244,8 @@ class LLMStream(llm.LLMStream):
         self._request_id: str = ""
         self._ignoring_cot = False  # ignore chain of thought
         self._input_tokens = 0
+        self._cache_creation_tokens = 0
+        self._cache_read_tokens = 0
         self._output_tokens = 0
 
     async def _run(self) -> None:
@@ -224,7 +267,12 @@ class LLMStream(llm.LLMStream):
                         usage=llm.CompletionUsage(
                             completion_tokens=self._output_tokens,
                             prompt_tokens=self._input_tokens,
-                            total_tokens=self._input_tokens + self._output_tokens,
+                            total_tokens=self._input_tokens
+                            + self._output_tokens
+                            + self._cache_creation_tokens
+                            + self._cache_read_tokens,
+                            cache_creation_input_tokens=self._cache_creation_tokens,
+                            cache_read_input_tokens=self._cache_read_tokens,
                         ),
                     )
                 )
@@ -249,6 +297,13 @@ class LLMStream(llm.LLMStream):
             self._output_tokens = event.message.usage.output_tokens
             # custom
             self._llm.emit("llm_stream_begun")
+            # normal
+            if event.message.usage.cache_creation_input_tokens:
+                self._cache_creation_tokens = (
+                    event.message.usage.cache_creation_input_tokens
+                )
+            if event.message.usage.cache_read_input_tokens:
+                self._cache_read_tokens = event.message.usage.cache_read_input_tokens
         elif event.type == "message_delta":
             self._output_tokens += event.usage.output_tokens
         elif event.type == "content_block_start":
@@ -328,6 +383,7 @@ def _latest_system_message(chat_ctx: llm.ChatContext) -> str:
             latest_system_str = " ".join(
                 [c for c in latest_system_message.content if isinstance(c, str)]
             )
+    
     return latest_system_str
 
 
@@ -420,8 +476,9 @@ def _build_anthropic_message(
                         )
                     )
                 elif isinstance(cnt, llm.ChatImage):
-                    a_content.append(_build_anthropic_image_content(cnt, cache_key))
-
+                    a_content.append(
+                        _build_anthropic_image_content(cnt, cache_key, cache_ctrl)
+                    )
         if msg.tool_calls is not None:
             for fnc in msg.tool_calls:
                 tool_use = anthropic.types.ToolUseBlockParam(
@@ -429,6 +486,7 @@ def _build_anthropic_message(
                     type="tool_use",
                     name=fnc.function_info.name,
                     input=fnc.arguments,
+                    cache_control=cache_ctrl,
                 )
                 a_content.append(tool_use)
 
@@ -447,6 +505,7 @@ def _build_anthropic_message(
             type="tool_result",
             content=msg.content,
             is_error=msg.tool_exception is not None,
+            cache_control=cache_ctrl,
         )
         return {
             "role": "user",
@@ -457,7 +516,9 @@ def _build_anthropic_message(
 
 
 def _build_anthropic_image_content(
-    image: llm.ChatImage, cache_key: Any
+    image: llm.ChatImage,
+    cache_key: Any,
+    cache_ctrl: anthropic.types.CacheControlEphemeralParam | None,
 ) -> anthropic.types.ImageBlockParam:
     if isinstance(image.image, str):  # image is a URL
         if not image.image.startswith("data:"):
@@ -483,6 +544,7 @@ def _build_anthropic_image_content(
                         media_type,
                     ),
                 },
+                "cache_control": cache_ctrl,
             }
         except (ValueError, IndexError) as e:
             raise ValueError(
@@ -510,6 +572,7 @@ def _build_anthropic_image_content(
                 "data": image._cache[cache_key],
                 "media_type": "image/jpeg",
             },
+            "cache_control": cache_ctrl,
         }
 
     raise ValueError(
@@ -519,6 +582,7 @@ def _build_anthropic_image_content(
 
 def _build_function_description(
     fnc_info: llm.function_context.FunctionInfo,
+    cache_ctrl: anthropic.types.CacheControlEphemeralParam | None,
 ) -> anthropic.types.ToolParam:
     def build_schema_field(arg_info: llm.function_context.FunctionArgInfo):
         def type2str(t: type) -> str:
@@ -540,7 +604,7 @@ def _build_function_description(
         if arg_info.description:
             p["description"] = arg_info.description
 
-        is_optional, inner_th = _is_optional_type(arg_info.type)
+        _, inner_th = _is_optional_type(arg_info.type)
 
         if get_origin(inner_th) is list:
             inner_type = get_args(inner_th)[0]
@@ -562,8 +626,9 @@ def _build_function_description(
     for arg_info in fnc_info.arguments.values():
         input_schema[arg_info.name] = build_schema_field(arg_info)
 
-    return {
-        "name": fnc_info.name,
-        "description": fnc_info.description,
-        "input_schema": input_schema,
-    }
+    return anthropic.types.ToolParam(
+        name=fnc_info.name,
+        description=fnc_info.description,
+        input_schema=input_schema,
+        cache_control=cache_ctrl,
+    )
