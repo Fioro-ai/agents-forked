@@ -368,7 +368,9 @@ class LLMStream(llm.LLMStream):
         return None
 
 
-def _latest_system_message(chat_ctx: llm.ChatContext) -> str:
+def _latest_system_message(
+    chat_ctx: llm.ChatContext
+) -> anthropic.types.TextBlockParam | None:
     latest_system_message: llm.ChatMessage | None = None
     for m in chat_ctx.messages:
         if m.role == "system":
@@ -383,8 +385,15 @@ def _latest_system_message(chat_ctx: llm.ChatContext) -> str:
             latest_system_str = " ".join(
                 [c for c in latest_system_message.content if isinstance(c, str)]
             )
-    
-    return latest_system_str
+    if latest_system_str:
+        system_text_block = anthropic.types.TextBlockParam(
+            text=latest_system_str,
+            type="text",
+            cache_control=None,
+        )
+        return system_text_block
+    return None
+
 
 
 def _merge_messages(
