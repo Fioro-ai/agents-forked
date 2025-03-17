@@ -424,6 +424,12 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
     # custom    
     def let_speak(self):
         self.hold_back_counterpart = False
+        self._validate_reply_if_possible()
+
+    def hold_back(self):
+        self.hold_back_counterpart = True
+
+
 
     def on(self, event: EventTypes, callback: Callable[[Any], None] | None = None):
         """Register a callback for an event
@@ -620,6 +626,11 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
 
         def _on_interim_transcript(ev: stt.SpeechEvent) -> None:
             self._transcribed_interim_text = ev.alternatives[0].text
+            logger.debug(
+                "received interim transcript",
+                extra={"interim_transcript": self._transcribed_interim_text},
+            )
+
 
         def _on_final_transcript(ev: stt.SpeechEvent) -> None:
             new_transcript = ev.alternatives[0].text
@@ -1177,7 +1188,6 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
 
     def _validate_reply_if_possible(self) -> None:
         """Check if the new agent speech should be played"""
-
         # custom - do not let counterpart speak
         if self.mode == "manual" and self.hold_back_counterpart:
             return
