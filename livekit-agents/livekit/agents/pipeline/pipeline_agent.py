@@ -558,6 +558,7 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
     async def _on_llm_stream_begun(self) -> None:
         """Handler called when LLM stream begins."""
         self.llm_stream_begun = True
+        logger.debug("First LLM token received")
        
 
     async def aclose(self) -> None:
@@ -626,10 +627,19 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
 
         def _on_interim_transcript(ev: stt.SpeechEvent) -> None:
             self._transcribed_interim_text = ev.alternatives[0].text
+            confidence = ev.alternatives[0].confidence
             logger.debug(
                 "received interim transcript",
-                extra={"interim_transcript": self._transcribed_interim_text},
+                extra={"interim_transcript": self._transcribed_interim_text, 
+                       "confidence":  confidence},
             )
+
+            # if there is an interim transcript with high confidence, try to interrupt (sometimes VAD is not reliable)
+            if confidence > 0.85:
+                if self._playing_speech and self._should_interrupt():
+                    logger.debug("interrupting using interim transcripts")
+                self._interrupt_if_possible()
+
 
 
         def _on_final_transcript(ev: stt.SpeechEvent) -> None:
@@ -699,6 +709,7 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
             self.emit("agent_started_speaking")
             self._update_state("speaking")
             self._is_agent_speaking = True
+            self.llm_stream_begun = False
 
 
         def _on_playout_stopped(interrupted: bool) -> None:
@@ -1267,6 +1278,7 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
 
     def _should_interrupt(self) -> bool:
         if self._playing_speech is None:
+            logger.info("not interrupting, no speech playing")
             return False
         
         # custom when the agent is actually speaking do not interrupt
@@ -1275,6 +1287,7 @@ class VoicePipelineAgent(utils.EventEmitter[EventTypes]):
 
         # custom when the LLM stream has begun do not interrupt
         if self.llm_stream_begun:
+            logger.info("not interrupting because LLM stream has begun")
             return False
 
         if (
