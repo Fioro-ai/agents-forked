@@ -113,6 +113,8 @@ class STTOptions:
     numerals: bool = False
     mip_opt_out: bool = False
     tags: NotGivenOr[list[str]] = NOT_GIVEN
+    # custom
+    replace: NotGivenOr[list[str]] = NOT_GIVEN
 
 
 class STT(stt.STT):
@@ -140,6 +142,8 @@ class STT(stt.STT):
         energy_filter: AudioEnergyFilter | bool = False,
         numerals: bool = False,
         mip_opt_out: bool = False,
+        # custom
+        replace: NotGivenOr[list[str]] = NOT_GIVEN,
     ) -> None:
         """Create a new instance of Deepgram STT.
 
@@ -208,6 +212,8 @@ class STT(stt.STT):
             numerals=numerals,
             mip_opt_out=mip_opt_out,
             tags=_validate_tags(tags) if is_given(tags) else [],
+            # custom
+            replace=replace if is_given(replace) else None,
         )
         self._session = http_session
         self._streams = weakref.WeakSet[SpeechStream]()
@@ -306,6 +312,8 @@ class STT(stt.STT):
         numerals: NotGivenOr[bool] = NOT_GIVEN,
         mip_opt_out: NotGivenOr[bool] = NOT_GIVEN,
         tags: NotGivenOr[list[str]] = NOT_GIVEN,
+        # custom
+        replace: list[str] | None = None,
     ):
         if is_given(language):
             self._opts.language = language
@@ -337,6 +345,9 @@ class STT(stt.STT):
             self._opts.mip_opt_out = mip_opt_out
         if is_given(tags):
             self._opts.tags = _validate_tags(tags)
+        # custom
+        if is_given(replace):
+            self._opts.replace = replace    
 
         for stream in self._streams:
             stream.update_options(
@@ -354,6 +365,7 @@ class STT(stt.STT):
                 profanity_filter=profanity_filter,
                 numerals=numerals,
                 mip_opt_out=mip_opt_out,
+                replace=replace,
             )
 
     def _sanitize_options(
@@ -430,6 +442,8 @@ class SpeechStream(stt.SpeechStream):
         numerals: NotGivenOr[bool] = NOT_GIVEN,
         mip_opt_out: NotGivenOr[bool] = NOT_GIVEN,
         tags: NotGivenOr[list[str]] = NOT_GIVEN,
+        # custom 
+        replace: NotGivenOr[list[str]] = NOT_GIVEN
     ):
         if is_given(language):
             self._opts.language = language
@@ -461,6 +475,9 @@ class SpeechStream(stt.SpeechStream):
             self._opts.mip_opt_out = mip_opt_out
         if is_given(tags):
             self._opts.tags = _validate_tags(tags)
+        # custom
+        if is_given(replace):
+            self._opts.replace = replace
 
         self._reconnect_event.set()
 
@@ -617,6 +634,9 @@ class SpeechStream(stt.SpeechStream):
 
         if self._opts.tags:
             live_config["tag"] = self._opts.tags
+
+        if self._opts.replace:
+            live_config["replace"] = self._opts.replace
 
         ws = await asyncio.wait_for(
             self._session.ws_connect(
