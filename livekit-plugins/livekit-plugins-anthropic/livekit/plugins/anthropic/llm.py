@@ -166,7 +166,7 @@ class LLM(llm.LLM):
                         anthropic_tool_choice["disable_parallel_tool_use"] = not parallel_tool_calls
                     extra["tool_choice"] = anthropic_tool_choice
 
-        anthropic_ctx, system_message = to_chat_ctx(chat_ctx, id(self), caching=self._opts.caching)
+        anthropic_ctx, system_message = to_chat_ctx(chat_ctx, id(self))
 
         if system_message:
             extra["system"] = [system_message]
@@ -257,6 +257,9 @@ class LLMStream(llm.LLMStream):
 
     def _parse_event(self, event: anthropic.types.RawMessageStreamEvent) -> llm.ChatChunk | None:
         if event.type == "message_start":
+            # custom
+            self._llm.emit("first_token_received")
+
             self._request_id = event.message.id
             self._input_tokens = event.message.usage.input_tokens
             self._output_tokens = event.message.usage.output_tokens

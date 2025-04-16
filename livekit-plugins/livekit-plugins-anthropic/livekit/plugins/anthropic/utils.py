@@ -27,28 +27,55 @@ def to_fnc_ctx(
 def to_chat_ctx(
     chat_ctx: llm.ChatContext,
     cache_key: Any,
-    caching: Literal["ephemeral"] | None,
 ) -> list[anthropic.types.MessageParam]:
     messages: list[anthropic.types.MessageParam] = []
     system_message: anthropic.types.TextBlockParam | None = None
     current_role: str | None = None
     content: list[anthropic.types.TextBlockParam] = []
+    
+    # Custom caching logic variables
+    ephemeral_char_count = 0
+    ephemeral_count = 0
+    ephemeral_max_count = 4  # Maximum 4 breakpoints as requested
+    user_msg_index = 0
+    
     for i, msg in enumerate(chat_ctx.items):
+        # Check if this message should be ephemeral based on custom logic
+        ephemeral = False
+        
         if msg.type == "message" and msg.role == "system":
             for content in msg.content:
                 if content and isinstance(content, str):
                     system_message = anthropic.types.TextBlockParam(
                         text=content,
                         type="text",
-                        cache_control=CACHE_CONTROL_EPHEMERAL if caching == "ephemeral" else None,
+                        cache_control=None,
                     )
             continue
+        
+        # Count characters in the message
+        if msg.type == "message" and msg.text_content:
+                ephemeral_char_count += len(msg.text_content)
+        
+        # Determine if this should be an ephemeral breakpoint
+        if msg.type == "message" and msg.role == "user" and ephemeral_count < ephemeral_max_count:
+            user_msg_index += 1
 
-        cache_ctrl = (
-            CACHE_CONTROL_EPHEMERAL
-            if (i == len(chat_ctx.items) - 1) and caching == "ephemeral"
-            else None
-        )
+            # we always set a breakpoint on the SECOND user message
+            if ephemeral_count == 0 and user_msg_index == 2:
+                ephemeral = True
+                ephemeral_count += 1
+                ephemeral_char_count = 0
+            
+            # all other breakpoints are based on character count between last breakpoint and new user message
+            elif ephemeral_count > 0 and ephemeral_char_count >= 4200:
+                ephemeral = True
+                ephemeral_count += 1
+                ephemeral_char_count = 0
+        
+        # Set cache control based on custom logic
+        cache_ctrl = CACHE_CONTROL_EPHEMERAL if ephemeral else None
+        
         if msg.type == "message":
             role = "assistant" if msg.role == "assistant" else "user"
         elif msg.type == "function_call":
@@ -104,7 +131,7 @@ def to_chat_ctx(
                 content=[anthropic.types.TextBlockParam(text="(empty)", type="text")],
             ),
         )
-
+    
     return messages, system_message
 
 
