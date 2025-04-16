@@ -218,6 +218,19 @@ class Agent:
         """
         return self._allow_interruptions
 
+
+    # make a setter out of the _allow_interruptions # custom
+    @allow_interruptions.setter
+    def allow_interruptions(self, value: bool) -> None:
+        """
+        Set whether interruptions (e.g., stopping TTS playback) are allowed.
+
+        Args:
+            value (bool): Whether to allow interruptions.
+        """
+        self._allow_interruptions = value
+
+
     @property
     def realtime_llm_session(self) -> llm.RealtimeSession:
         """
