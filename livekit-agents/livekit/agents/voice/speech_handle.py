@@ -60,6 +60,12 @@ class SpeechHandle:
     def allow_interruptions(self) -> bool:
         return self._allow_interruptions
 
+    # custom: setter for allow_interruptions
+    @allow_interruptions.setter
+    def allow_interruptions(self, value: bool) -> None:
+        self._allow_interruptions = value
+
+
     @property
     def parent(self) -> SpeechHandle | None:
         """
