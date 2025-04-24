@@ -79,6 +79,7 @@ class AgentActivity(RecognitionHooks):
         self._q_updated = asyncio.Event()
 
         self._main_atask: asyncio.Task | None = None
+        self._user_turn_completed_atask: asyncio.Task | None = None
         self._speech_tasks: list[asyncio.Task] = []
 
         from .. import llm as large_language_model
@@ -802,6 +803,42 @@ class AgentActivity(RecognitionHooks):
         )
 
     async def on_end_of_turn(self, info: _EndOfTurnInfo) -> None:
+        # IMPORTANT: This method can be cancelled by the AudioRecognition
+        # We explicitly create a new task to avoid cancelling user code.
+
+        if self.draining:
+            logger.warning(
+                "skipping user input, task is draining",
+                extra={"user_input": info.new_transcript},
+            )
+            log_event(
+                "skipping user input, task is draining",
+                user_input=info.new_transcript,
+            )
+            return
+
+        if self.draining:
+            # TODO(theomonnom): should we "forward" this new turn to the next agent/activity?
+            logger.warning("ignoring new user turn, the agent is draining")
+            return
+
+        old_task = self._user_turn_completed_atask
+        self._user_turn_completed_atask = self._create_speech_task(
+            self._user_turn_completed_task(old_task, info),
+            name="AgentActivity._user_turn_completed_task",
+        )
+
+    @utils.log_exceptions(logger=logger)
+    async def _user_turn_completed_task(
+        self, old_task: asyncio.Task | None, info: _EndOfTurnInfo
+    ) -> None:
+        if old_task is not None:
+            # We never cancel user code as this is very confusing.
+            # So we wait for the old execution of on_user_turn_completed to finish.
+            # In practice this is OK because most speeches will be interrupted if a new turn
+            # is detected. So the previous execution should complete quickly.
+            await old_task
+
         # When the audio recognition detects the end of a user turn:
         #  - check if realtime model server-side turn detection is enabled
         #  - check if there is no current generation happening
@@ -812,16 +849,15 @@ class AgentActivity(RecognitionHooks):
         if isinstance(self.llm, llm.RealtimeModel):
             if self.llm.capabilities.turn_detection:
                 return
+
             if self._rt_session is not None:
                 self._rt_session.commit_audio()
-
-        new_transcript = info.new_transcript
 
         if self._current_speech is not None:
             if not self._current_speech.allow_interruptions:
                 logger.warning(
                     "skipping reply to user input, current speech generation cannot be interrupted",
-                    extra={"user_input": new_transcript},
+                    extra={"user_input": info.new_transcript},
                 )
                 return
 
@@ -833,23 +869,8 @@ class AgentActivity(RecognitionHooks):
             if self._rt_session is not None:
                 self._rt_session.interrupt()
 
-        if self.draining:
-            logger.warning(
-                "skipping user input, task is draining",
-                extra={"user_input": new_transcript},
-            )
-            log_event(
-                "skipping user input, task is draining",
-                user_input=new_transcript,
-            )
-            return
-
-        if self.draining:
-            # TODO(theomonnom): should we "forward" this new turn to the next agent/activity?
-            logger.warning("ignoring new user turn, the agent is draining")
-            return
-
-        user_message = llm.ChatMessage(role="user", content=[new_transcript])  # id is generated
+        # id is generated
+        user_message = llm.ChatMessage(role="user", content=[info.new_transcript])
 
         # create a temporary mutable chat context to pass to on_user_turn_completed
         # the user can edit it for the current generation, but changes will not be kept inside the
@@ -862,6 +883,9 @@ class AgentActivity(RecognitionHooks):
             )
         except StopResponse:
             return  # ignore this turn
+        except Exception:
+            logger.exception("error occured during on_user_turn_completed")
+            return
 
         callback_duration = time.time() - start_time
 
@@ -874,6 +898,13 @@ class AgentActivity(RecognitionHooks):
         speech_handle = self._generate_reply(
             user_message=user_message, chat_ctx=temp_mutable_chat_ctx
         )
+
+        if self._user_turn_completed_atask != asyncio.current_task():
+            # If a new user turn has already started, interrupt this one since it's now outdated
+            # (We still create the SpeechHandle and the generate_reply coroutine, otherwise we may
+            # lose data like the beginning of a user speech).
+            speech_handle.interrupt()
+
         eou_metrics = EOUMetrics(
             timestamp=time.time(),
             end_of_utterance_delay=info.end_of_utterance_delay,
@@ -986,6 +1017,7 @@ class AgentActivity(RecognitionHooks):
             msg = self._agent._chat_ctx.add_message(
                 role="assistant", content=text_out.text, interrupted=speech_handle.interrupted
             )
+            speech_handle._set_chat_message(msg)
             self._session._conversation_item_added(msg)
 
         self._session._update_agent_state("listening")
@@ -1022,8 +1054,10 @@ class AgentActivity(RecognitionHooks):
         tool_ctx = llm.ToolContext(tools)
 
         if new_message is not None:
-            chat_ctx.items.append(new_message)
-            self._agent._chat_ctx.items.append(new_message)
+            idx = chat_ctx.find_insertion_index(created_at=new_message.created_at)
+            chat_ctx.items.insert(idx, new_message)
+            idx = self._agent._chat_ctx.find_insertion_index(created_at=new_message.created_at)
+            self._agent._chat_ctx.items.insert(idx, new_message)
             self._session._conversation_item_added(new_message)
 
         if instructions is not None:
@@ -1137,7 +1171,7 @@ class AgentActivity(RecognitionHooks):
             self._agent._chat_ctx.items.append(msg)
             self._session._update_agent_state("listening")
             self._session._conversation_item_added(msg)
-
+            speech_handle._set_chat_message(msg)
             speech_handle._mark_playout_done()
             await utils.aio.cancel_and_wait(exe_task)
             return
@@ -1148,6 +1182,7 @@ class AgentActivity(RecognitionHooks):
             )
             self._agent._chat_ctx.items.append(msg)
             self._session._conversation_item_added(msg)
+            speech_handle._set_chat_message(msg)
 
         self._session._update_agent_state("listening")
         log_event("playout completed", speech_id=speech_handle.id)
@@ -1432,6 +1467,7 @@ class AgentActivity(RecognitionHooks):
                     role="assistant", content=[forwarded_text], id=msg_id, interrupted=True
                 )
                 self._agent._chat_ctx.items.append(msg)
+                speech_handle._set_chat_message(msg)
                 self._session._conversation_item_added(msg)
 
             speech_handle._mark_playout_done()
@@ -1447,6 +1483,7 @@ class AgentActivity(RecognitionHooks):
                 role="assistant", content=[text_out.text], id=msg_id, interrupted=False
             )
             self._agent._chat_ctx.items.append(msg)
+            speech_handle._set_chat_message(msg)
             self._session._conversation_item_added(msg)
 
         tool_output.first_tool_fut.add_done_callback(
