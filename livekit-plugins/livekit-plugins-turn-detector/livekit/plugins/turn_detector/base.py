@@ -96,6 +96,7 @@ class _EUORunnerBase(_InferenceRunner):
         start_time = time.perf_counter()
 
         text = self._format_chat_ctx(chat_ctx)
+
         inputs = self._tokenizer(
             text,
             add_special_tokens=False,
@@ -107,6 +108,13 @@ class _EUORunnerBase(_InferenceRunner):
         outputs = self._session.run(None, {"input_ids": inputs["input_ids"].astype("int64")})
         eou_probability = outputs[0][0]
         end_time = time.perf_counter()
+        logger.info(
+            "eou inference",
+            extra={
+                "eou_probability": eou_probability,
+                "duration": round(end_time - start_time, 3),
+            },
+        )
 
         data = {
             "eou_probability": float(eou_probability),
