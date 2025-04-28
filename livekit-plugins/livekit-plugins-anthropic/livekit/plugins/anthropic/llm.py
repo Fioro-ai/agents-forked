@@ -100,7 +100,6 @@ class LLM(llm.LLM):
         if not anthropic_api_key:
             raise ValueError("Anthropic API key is required")
 
-
         if client:
             self._client = client
         else:
@@ -182,12 +181,18 @@ class LLM(llm.LLM):
             **extra,
         )
 
+        conn_options_override = APIConnectOptions(
+            max_retry=3,
+            retry_interval=0.1,
+            timeout=4
+        )
+
         return LLMStream(
             self,
             anthropic_stream=stream,
             chat_ctx=chat_ctx,
             tools=tools,
-            conn_options=conn_options,
+            conn_options=conn_options_override,
         )
 
 
@@ -263,7 +268,6 @@ class LLMStream(llm.LLMStream):
         if event.type == "message_start":
             # custom
             self._llm.emit("first_token_received")
-
             self._request_id = event.message.id
             self._input_tokens = event.message.usage.input_tokens
             self._output_tokens = event.message.usage.output_tokens
@@ -271,6 +275,8 @@ class LLMStream(llm.LLMStream):
                 self._cache_creation_tokens = event.message.usage.cache_creation_input_tokens
             if event.message.usage.cache_read_input_tokens:
                 self._cache_read_tokens = event.message.usage.cache_read_input_tokens
+
+                print("cache_read_input_tokens", self._cache_read_tokens)
         elif event.type == "message_delta":
             self._output_tokens += event.usage.output_tokens
         elif event.type == "content_block_start":
