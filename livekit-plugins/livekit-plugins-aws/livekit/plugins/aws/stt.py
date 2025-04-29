@@ -19,6 +19,7 @@ import aioboto3
 from amazon_transcribe.auth import StaticCredentialResolver
 from amazon_transcribe.client import TranscribeStreamingClient
 from amazon_transcribe.model import Result, TranscriptEvent
+import time
 
 from livekit import rtc
 from livekit.agents import DEFAULT_API_CONNECT_OPTIONS, APIConnectOptions, stt, utils
@@ -172,12 +173,30 @@ class SpeechStream(stt.SpeechStream):
             filtered_config = {k: v for k, v in live_config.items() if v and is_given(v)}
             stream = await client.start_stream_transcription(**filtered_config)
 
+            last_sent = time.monotonic()
+            # 100 ms of silence for 48 kHz / 16-bit mono
+            silence = b"\x00\x00" * int(self._opts.sample_rate // 10)
+
             @utils.log_exceptions(logger=logger)
             async def input_generator():
-                async for frame in self._input_ch:
+                nonlocal last_sent
+                while True:
+                    try:
+                        # wait up to 5 s for real audio
+                        frame = await asyncio.wait_for(self._input_ch.recv(), timeout=5)
+                    except asyncio.TimeoutError:
+                        # ▶ keep-alive: 100 ms of silence
+                        await stream.input_stream.send_audio_event(audio_chunk=silence)
+                        continue
+                    except utils.aio.channel.ChanClosed:
+                        break  # upstream closed; fall through to stream end
                     if isinstance(frame, rtc.AudioFrame):
-                        await stream.input_stream.send_audio_event(audio_chunk=frame.data.tobytes())
+                        await stream.input_stream.send_audio_event(
+                            audio_chunk=frame.data.tobytes()
+                        )
+                        last_sent = time.monotonic()
                 await stream.input_stream.end_stream()
+
 
             @utils.log_exceptions(logger=logger)
             async def handle_transcript_events():
