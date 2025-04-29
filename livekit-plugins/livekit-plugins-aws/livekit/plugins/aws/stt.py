@@ -173,29 +173,23 @@ class SpeechStream(stt.SpeechStream):
             filtered_config = {k: v for k, v in live_config.items() if v and is_given(v)}
             stream = await client.start_stream_transcription(**filtered_config)
 
-            last_sent = time.monotonic()
-            # 100 ms of silence for 48 kHz / 16-bit mono
-            silence = b"\x00\x00" * int(self._opts.sample_rate // 10)
+            samples_per_channel = self._opts.sample_rate // 100      # 10 ms
+            silence = b"\x00\x00" * samples_per_channel              # mono, 16-bit
 
             @utils.log_exceptions(logger=logger)
             async def input_generator():
-                nonlocal last_sent
                 while True:
                     try:
-                        # wait up to 5 s for real audio
                         frame = await asyncio.wait_for(self._input_ch.recv(), timeout=5)
                     except asyncio.TimeoutError:
-                        # ▶ keep-alive: 100 ms of silence
                         await stream.input_stream.send_audio_event(audio_chunk=silence)
                         continue
                     except utils.aio.channel.ChanClosed:
-                        break  # upstream closed; fall through to stream end
+                        break
                     if isinstance(frame, rtc.AudioFrame):
-                        await stream.input_stream.send_audio_event(
-                            audio_chunk=frame.data.tobytes()
-                        )
-                        last_sent = time.monotonic()
+                        await stream.input_stream.send_audio_event(audio_chunk=frame.data.tobytes())
                 await stream.input_stream.end_stream()
+
 
 
             @utils.log_exceptions(logger=logger)
