@@ -269,6 +269,9 @@ class LLMStream(llm.LLMStream):
         retryable = True
         request_id = utils.shortuuid()
 
+        # custom 
+        has_received_first_chunk = False
+
         try:
             turns, system_instruction = to_chat_ctx(self._chat_ctx, id(self._llm))
             function_declarations = to_fnc_ctx(self._tools)
@@ -288,6 +291,11 @@ class LLMStream(llm.LLMStream):
             )
 
             async for response in stream:
+                if not has_received_first_chunk:
+                    has_received_first_chunk = True
+                    self._llm.emit("first_token_received")
+
+
                 if response.prompt_feedback:
                     raise APIStatusError(
                         response.prompt_feedback.json(),
