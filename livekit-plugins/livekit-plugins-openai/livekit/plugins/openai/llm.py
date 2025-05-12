@@ -572,8 +572,15 @@ class LLMStream(llm.LLMStream):
                 **self._extra_kwargs,
             )
 
+            # custom 
+            has_received_first_chunk = False
+
             async with stream:
                 async for chunk in stream:
+                    if not has_received_first_chunk:
+                        has_received_first_chunk = True
+                        self._llm.emit("first_token_received")
+
                     for choice in chunk.choices:
                         chat_chunk = self._parse_choice(chunk.id, choice)
                         if chat_chunk is not None:
