@@ -236,6 +236,27 @@ class LLM(llm.LLM):
         if is_given(self._opts.thinking_config):
             extra["thinking_config"] = self._opts.thinking_config
 
+
+        # disable any safety settings
+        extra["safety_settings"] =[
+            {
+                "category": "HARM_CATEGORY_HARASSMENT",
+                "threshold": "BLOCK_NONE"
+            },
+            {
+                "category": "HARM_CATEGORY_HATE_SPEECH",
+                "threshold": "BLOCK_NONE"
+            },
+            {
+                "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                "threshold": "BLOCK_NONE"
+            },
+            {
+                "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                "threshold": "BLOCK_NONE"
+            }
+        ]
+        
         return LLMStream(
             self,
             client=self._client,
@@ -308,11 +329,8 @@ class LLMStream(llm.LLMStream):
                     or not response.candidates[0].content
                     or not response.candidates[0].content.parts
                 ):
-                    raise APIStatusError(
-                        "No candidates in the response",
-                        retryable=True,
-                        request_id=request_id,
-                    )
+                    logger.warning("No candidates in the response")
+                    break
 
                 if len(response.candidates) > 1:
                     logger.warning(
