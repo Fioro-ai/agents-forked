@@ -54,6 +54,7 @@ class _LLMOptions:
     presence_penalty: NotGivenOr[float]
     frequency_penalty: NotGivenOr[float]
     thinking_config: NotGivenOr[types.ThinkingConfigOrDict]
+    stop_sequences: NotGivenOr[list[str]]
 
 
 class LLM(llm.LLM):
@@ -73,6 +74,7 @@ class LLM(llm.LLM):
         frequency_penalty: NotGivenOr[float] = NOT_GIVEN,
         tool_choice: NotGivenOr[ToolChoice] = NOT_GIVEN,
         thinking_config: NotGivenOr[types.ThinkingConfigOrDict] = NOT_GIVEN,
+        stop_sequences: NotGivenOr[list[str]] = NOT_GIVEN,
     ) -> None:
         """
         Create a new instance of Google GenAI LLM.
@@ -153,6 +155,7 @@ class LLM(llm.LLM):
             presence_penalty=presence_penalty,
             frequency_penalty=frequency_penalty,
             thinking_config=thinking_config,
+            stop_sequences=stop_sequences,
         )
         self._client = genai.Client(
             api_key=gemini_api_key,
@@ -231,6 +234,9 @@ class LLM(llm.LLM):
             extra["presence_penalty"] = self._opts.presence_penalty
         if is_given(self._opts.frequency_penalty):
             extra["frequency_penalty"] = self._opts.frequency_penalty
+        if is_given(self._opts.stop_sequences):
+            extra["stop_sequences"] = self._opts.stop_sequences
+
 
         # Add thinking config if thinking_budget is provided
         if is_given(self._opts.thinking_config):
@@ -256,7 +262,14 @@ class LLM(llm.LLM):
                 "threshold": "BLOCK_NONE"
             }
         ]
-        
+
+
+        for msg in chat_ctx.items:
+            if msg.role == "user":
+                print(f"User message: {msg.text_content}")
+            elif msg.role == "assistant":
+                print(f"Assistant message: {msg.text_content}")
+
         return LLMStream(
             self,
             client=self._client,
@@ -339,6 +352,8 @@ class LLMStream(llm.LLMStream):
 
                 for part in response.candidates[0].content.parts:
                     chat_chunk = self._parse_part(request_id, part)
+                    print(f"Chat chunk: {chat_chunk}")
+
                     if chat_chunk is not None:
                         retryable = False
                         self._event_ch.send_nowait(chat_chunk)
