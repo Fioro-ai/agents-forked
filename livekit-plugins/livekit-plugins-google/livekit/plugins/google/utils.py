@@ -107,8 +107,8 @@ def to_chat_ctx(
         turns.append(types.Content(role=current_role, parts=parts))
 
     # Gemini requires the last message to end with user's turn before they can generate
-    if generate and current_role != "user":
-        turns.append(types.Content(role="user", parts=[types.Part(text=".")]))
+    #if generate and current_role != "user":
+    #    turns.append(types.Content(role="user", parts=[types.Part(text=".")]))
 
     return turns, system_instruction
 
