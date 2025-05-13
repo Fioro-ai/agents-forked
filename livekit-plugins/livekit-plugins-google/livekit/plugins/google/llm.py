@@ -263,13 +263,6 @@ class LLM(llm.LLM):
             }
         ]
 
-
-        for msg in chat_ctx.items:
-            if msg.role == "user":
-                print(f"User message: {msg.text_content}")
-            elif msg.role == "assistant":
-                print(f"Assistant message: {msg.text_content}")
-
         return LLMStream(
             self,
             client=self._client,
@@ -352,7 +345,6 @@ class LLMStream(llm.LLMStream):
 
                 for part in response.candidates[0].content.parts:
                     chat_chunk = self._parse_part(request_id, part)
-                    print(f"Chat chunk: {chat_chunk}")
 
                     if chat_chunk is not None:
                         retryable = False
