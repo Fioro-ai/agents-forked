@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 from copy import deepcopy
 from typing import Any
@@ -9,15 +8,29 @@ from pydantic import TypeAdapter
 
 from google.genai import types
 from livekit.agents import llm
-from livekit.agents.llm import FunctionTool, utils as llm_utils
+from livekit.agents.llm import utils as llm_utils
+from livekit.agents.llm.tool_context import (
+    FunctionTool,
+    RawFunctionTool,
+    get_raw_function_info,
+    is_function_tool,
+    is_raw_function_tool,
+)
 
-from .log import logger
-
-__all__ = ["to_chat_ctx", "to_fnc_ctx"]
+__all__ = ["to_fnc_ctx"]
 
 
-def to_fnc_ctx(fncs: list[FunctionTool]) -> list[types.FunctionDeclaration]:
-    return [_build_gemini_fnc(fnc) for fnc in fncs]
+def to_fnc_ctx(fncs: list[FunctionTool | RawFunctionTool]) -> list[types.FunctionDeclaration]:
+    tools: list[types.FunctionDeclaration] = []
+    for fnc in fncs:
+        if is_raw_function_tool(fnc):
+            info = get_raw_function_info(fnc)
+            tools.append(types.FunctionDeclaration(**info.raw_schema))
+
+        elif is_function_tool(fnc):
+            tools.append(_build_gemini_fnc(fnc))
+
+    return tools
 
 
 def get_tool_results_for_realtime(
@@ -133,7 +146,7 @@ def _build_gemini_fnc(function_tool: FunctionTool) -> types.FunctionDeclaration:
     return types.FunctionDeclaration(
         name=fnc["name"],
         description=fnc["description"],
-        parameters=json_schema,
+        parameters=types.Schema.model_validate(json_schema),
     )
 
 
