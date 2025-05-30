@@ -22,7 +22,6 @@ import weakref
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
-from urllib.parse import urlencode
 
 import aiohttp
 import numpy as np
@@ -43,7 +42,7 @@ from livekit.agents.types import (
 )
 from livekit.agents.utils import AudioBuffer, is_given
 
-from ._utils import PeriodicCollector
+from ._utils import PeriodicCollector, _to_deepgram_url
 from .log import logger
 from .models import DeepgramLanguages, DeepgramModels
 
@@ -95,7 +94,7 @@ class AudioEnergyFilter:
 
 @dataclass
 class STTOptions:
-    language: DeepgramLanguages | str
+    language: DeepgramLanguages | str | None
     detect_language: bool
     interim_results: bool
     punctuate: bool
@@ -186,9 +185,10 @@ class STT(stt.STT):
         )
         self._base_url = base_url
 
-        self._api_key = api_key if is_given(api_key) else os.environ.get("DEEPGRAM_API_KEY")
-        if not self._api_key:
+        deepgram_api_key = api_key if is_given(api_key) else os.environ.get("DEEPGRAM_API_KEY")
+        if not deepgram_api_key:
             raise ValueError("Deepgram API key is required")
+        self._api_key = deepgram_api_key
 
         model = _validate_model(model, language)
         _validate_keyterms(model, language, keyterms, keywords)
@@ -314,7 +314,7 @@ class STT(stt.STT):
         tags: NotGivenOr[list[str]] = NOT_GIVEN,
         # custom
         replace: list[str] | None = None,
-    ):
+    )-> None:
         if is_given(language):
             self._opts.language = language
         if is_given(model):
@@ -396,14 +396,13 @@ class SpeechStream(stt.SpeechStream):
         http_session: aiohttp.ClientSession,
         base_url: str,
     ) -> None:
-        super().__init__(stt=stt, conn_options=conn_options, sample_rate=opts.sample_rate)
-
         if opts.detect_language or opts.language is None:
             raise ValueError(
                 "language detection is not supported in streaming mode, "
                 "please disable it and specify a language"
             )
 
+        super().__init__(stt=stt, conn_options=conn_options, sample_rate=opts.sample_rate)
         self._opts = opts
         self._api_key = api_key
         self._session = http_session
@@ -444,7 +443,7 @@ class SpeechStream(stt.SpeechStream):
         tags: NotGivenOr[list[str]] = NOT_GIVEN,
         # custom 
         replace: NotGivenOr[list[str]] = NOT_GIVEN
-    ):
+    ) -> None:
         if is_given(language):
             self._opts.language = language
         if is_given(model):
@@ -484,7 +483,7 @@ class SpeechStream(stt.SpeechStream):
     async def _run(self) -> None:
         closing_ws = False
 
-        async def keepalive_task(ws: aiohttp.ClientWebSocketResponse):
+        async def keepalive_task(ws: aiohttp.ClientWebSocketResponse) -> None:
             # if we want to keep the connection alive even if no audio is sent,
             # Deepgram expects a keepalive message.
             # https://developers.deepgram.com/reference/listen-live#stream-keepalive
@@ -496,7 +495,7 @@ class SpeechStream(stt.SpeechStream):
                 return
 
         @utils.log_exceptions(logger=logger)
-        async def send_task(ws: aiohttp.ClientWebSocketResponse):
+        async def send_task(ws: aiohttp.ClientWebSocketResponse) -> None:
             nonlocal closing_ws
 
             # forward audio to deepgram in chunks of 50ms
@@ -547,7 +546,7 @@ class SpeechStream(stt.SpeechStream):
             await ws.send_str(SpeechStream._CLOSE_MSG)
 
         @utils.log_exceptions(logger=logger)
-        async def recv_task(ws: aiohttp.ClientWebSocketResponse):
+        async def recv_task(ws: aiohttp.ClientWebSocketResponse) -> None:
             nonlocal closing_ws
             while True:
                 msg = await ws.receive()
@@ -583,12 +582,13 @@ class SpeechStream(stt.SpeechStream):
                     asyncio.create_task(recv_task(ws)),
                     asyncio.create_task(keepalive_task(ws)),
                 ]
+                tasks_group = asyncio.gather(*tasks)
                 wait_reconnect_task = asyncio.create_task(self._reconnect_event.wait())
                 try:
                     done, _ = await asyncio.wait(
-                        [asyncio.gather(*tasks), wait_reconnect_task],
+                        (tasks_group, wait_reconnect_task),
                         return_when=asyncio.FIRST_COMPLETED,
-                    )  # type: ignore
+                    )
 
                     # propagate exceptions from completed tasks
                     for task in done:
@@ -601,6 +601,7 @@ class SpeechStream(stt.SpeechStream):
                     self._reconnect_event.clear()
                 finally:
                     await utils.aio.gracefully_cancel(*tasks, wait_reconnect_task)
+                    await tasks_group
             finally:
                 if ws is not None:
                     await ws.close()
@@ -769,26 +770,6 @@ def prerecorded_transcription_to_speech_event(
             for alt in dg_alts
         ],
     )
-
-
-def _to_deepgram_url(opts: dict, base_url: str, *, websocket: bool) -> str:
-    # don't modify the original opts
-    opts = opts.copy()
-    if opts.get("keywords"):
-        # convert keywords to a list of "keyword:intensifier"
-        opts["keywords"] = [
-            f"{keyword}:{intensifier}" for (keyword, intensifier) in opts["keywords"]
-        ]
-
-    # lowercase bools
-    opts = {k: str(v).lower() if isinstance(v, bool) else v for k, v in opts.items()}
-
-    if websocket and base_url.startswith("http"):
-        base_url = base_url.replace("http", "ws", 1)
-
-    elif not websocket and base_url.startswith("ws"):
-        base_url = base_url.replace("ws", "http", 1)
-    return f"{base_url}?{urlencode(opts, doseq=True)}"
 
 
 def _validate_model(
