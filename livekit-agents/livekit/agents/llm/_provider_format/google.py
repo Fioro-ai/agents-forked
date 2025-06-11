@@ -77,8 +77,9 @@ def to_chat_ctx(
         turns.append({"role": current_role, "parts": parts})
 
     # Gemini requires the last message to end with user's turn before they can generate
-    if inject_dummy_user_message and current_role != "user":
-        turns.append({"role": "user", "parts": [{"text": "."}]})
+    # custom - to be removed
+    #if inject_dummy_user_message and current_role != "user":
+    #    turns.append({"role": "user", "parts": [{"text": "."}]})
 
     return turns, GoogleFormatData(system_messages=system_messages)
 
