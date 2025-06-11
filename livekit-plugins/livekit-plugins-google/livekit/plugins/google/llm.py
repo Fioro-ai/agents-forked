@@ -235,6 +235,9 @@ class LLM(llm.LLM):
 
         if is_given(response_format):
             extra["response_schema"] = to_response_format(response_format)  # type: ignore
+            # custom add property ordering for gemini response format - like the keys are ordered in the schema
+            property_ordering = list(extra["response_schema"]["properties"].keys())
+            extra["response_schema"]["propertyOrdering"] = property_ordering
             extra["response_mime_type"] = "application/json"
 
         if is_given(self._opts.temperature):
