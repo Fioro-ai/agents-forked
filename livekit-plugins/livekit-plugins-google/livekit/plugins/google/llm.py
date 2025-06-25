@@ -19,6 +19,7 @@ import json
 import os
 from dataclasses import dataclass
 from typing import Any, cast
+import google.auth
 
 from google.auth._default_async import default_async
 from google.genai import Client, types
@@ -82,6 +83,7 @@ class LLM(llm.LLM):
         thinking_config: NotGivenOr[types.ThinkingConfigOrDict] = NOT_GIVEN,
         stop_sequences: NotGivenOr[list[str]] = NOT_GIVEN,
         gemini_tools: NotGivenOr[list[_LLMTool]] = NOT_GIVEN,
+        credentials: NotGivenOr[google.auth.credentials.Credentials] = NotGivenOr,
     ) -> None:
         """
         Create a new instance of Google GenAI LLM.
@@ -153,7 +155,7 @@ class LLM(llm.LLM):
                     raise ValueError(
                         "thinking_budget inside thinking_config must be between 0 and 24576"
                     )
-
+      
         self._opts = _LLMOptions(
             model=model,
             temperature=temperature,
@@ -175,6 +177,7 @@ class LLM(llm.LLM):
             vertexai=use_vertexai,
             project=gcp_project,
             location=gcp_location,
+            credentials=credentials if use_vertexai else None,
         )
 
     def chat(
