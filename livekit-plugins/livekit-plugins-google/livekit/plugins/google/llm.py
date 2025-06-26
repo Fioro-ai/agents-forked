@@ -61,7 +61,9 @@ class _LLMOptions:
     frequency_penalty: NotGivenOr[float]
     thinking_config: NotGivenOr[types.ThinkingConfigOrDict]
     stop_sequences: NotGivenOr[list[str]]
+    automatic_function_calling_config: NotGivenOr[types.AutomaticFunctionCallingConfigOrDict]
     gemini_tools: NotGivenOr[list[_LLMTool]]
+    http_options: NotGivenOr[types.HttpOptions]
 
 
 class LLM(llm.LLM):
@@ -82,8 +84,12 @@ class LLM(llm.LLM):
         tool_choice: NotGivenOr[ToolChoice] = NOT_GIVEN,
         thinking_config: NotGivenOr[types.ThinkingConfigOrDict] = NOT_GIVEN,
         stop_sequences: NotGivenOr[list[str]] = NOT_GIVEN,
-        gemini_tools: NotGivenOr[list[_LLMTool]] = NOT_GIVEN,
         credentials: NotGivenOr[google.auth.credentials.Credentials] = NotGivenOr,
+        automatic_function_calling_config: NotGivenOr[
+            types.AutomaticFunctionCallingConfigOrDict
+        ] = NOT_GIVEN,
+        gemini_tools: NotGivenOr[list[_LLMTool]] = NOT_GIVEN,
+        http_options: NotGivenOr[types.HttpOptions] = NOT_GIVEN,
     ) -> None:
         """
         Create a new instance of Google GenAI LLM.
@@ -109,7 +115,9 @@ class LLM(llm.LLM):
             frequency_penalty (float, optional): Penalizes the model for repeating words. Defaults to None.
             tool_choice (ToolChoice, optional): Specifies whether to use tools during response generation. Defaults to "auto".
             thinking_config (ThinkingConfigOrDict, optional): The thinking configuration for response generation. Defaults to None.
+            automatic_function_calling_config (AutomaticFunctionCallingConfigOrDict, optional): The automatic function calling configuration for response generation. Defaults to None.
             gemini_tools (list[LLMTool], optional): The Gemini-specific tools to use for the session.
+            http_options (HttpOptions, optional): The HTTP options to use for the session.
         """  # noqa: E501
         super().__init__()
         gcp_project = project if is_given(project) else os.environ.get("GOOGLE_CLOUD_PROJECT")
@@ -170,7 +178,9 @@ class LLM(llm.LLM):
             frequency_penalty=frequency_penalty,
             thinking_config=thinking_config,
             stop_sequences=stop_sequences,
+            automatic_function_calling_config=automatic_function_calling_config,
             gemini_tools=gemini_tools,
+            http_options=http_options,
         )
         self._client = Client(
             api_key=gemini_api_key,
@@ -289,6 +299,9 @@ class LLM(llm.LLM):
                 "threshold": "BLOCK_NONE"
             }
         ]
+        if is_given(self._opts.automatic_function_calling_config):
+            extra["automatic_function_calling"] = self._opts.automatic_function_calling_config
+
         gemini_tools = gemini_tools if is_given(gemini_tools) else self._opts.gemini_tools
 
         return LLMStream(
@@ -347,8 +360,9 @@ class LLMStream(llm.LLMStream):
                     if extra_data.system_messages
                     else None
                 ),
-                http_options=types.HttpOptions(
-                    timeout=int(self._conn_options.timeout * 1000),
+                http_options=(
+                    self._llm._opts.http_options
+                    or types.HttpOptions(timeout=int(self._conn_options.timeout * 1000))
                 ),
                 **self._extra_kwargs,
             )
