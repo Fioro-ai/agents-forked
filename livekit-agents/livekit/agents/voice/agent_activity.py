@@ -1592,7 +1592,11 @@ class AgentActivity(RecognitionHooks):
                 else:
                     forwarded_text = ""
 
-            copy_msg = generated_msg.model_copy()
+            # temp fix by niko
+            copy_msg = generated_msg.model_copy() if generated_msg else llm.ChatMessage(
+                role="user",
+                content=[],
+            )            
             copy_msg.content = [forwarded_text]
             copy_msg.interrupted = True
             if generated_msg:
