@@ -193,6 +193,10 @@ class LLM(llm.LLM):
             credentials=credentials if use_vertexai else None,
         )
 
+    @property
+    def model(self) -> str:
+        return self._opts.model
+
     def chat(
         self,
         *,
