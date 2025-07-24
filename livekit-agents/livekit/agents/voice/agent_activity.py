@@ -41,7 +41,7 @@ from .audio_recognition import (
     _PreemptiveGenerationInfo,
 )
 from .events import (
-    AgentFalseInterruptedEvent,
+    AgentFalseInterruptionEvent,
     ErrorEvent,
     FunctionToolsExecutedEvent,
     MetricsCollectedEvent,
@@ -1390,9 +1390,7 @@ class AgentActivity(RecognitionHooks):
 
             if speech_handle._interrupted_by_user:
                 self._session._schedule_agent_false_interruption(
-                    AgentFalseInterruptedEvent(
-                        speech_id=speech_handle.id, instructions=None, message=msg
-                    )
+                    AgentFalseInterruptionEvent(extra_instructions=None, message=msg)
                 )
 
         if self._session.agent_state == "speaking":
@@ -1592,24 +1590,21 @@ class AgentActivity(RecognitionHooks):
                 else:
                     forwarded_text = ""
 
-            # temp fix by niko
-            copy_msg = generated_msg.model_copy() if generated_msg else llm.ChatMessage(
-                role="user",
-                content=[],
-            )            
-            copy_msg.content = [forwarded_text]
-            copy_msg.interrupted = True
+            copy_msg: llm.ChatMessage | None = None
             if generated_msg:
+                copy_msg = generated_msg.model_copy()
+                copy_msg.content = [forwarded_text]
+                copy_msg.interrupted = True
+
                 if forwarded_text:
                     self._agent._chat_ctx.insert(copy_msg)
                     self._session._conversation_item_added(copy_msg)
+
                 current_span.set_attribute(trace_types.ATTR_RESPONSE_TEXT, forwarded_text)
 
             if speech_handle._interrupted_by_user:
                 self._session._schedule_agent_false_interruption(
-                    AgentFalseInterruptedEvent(
-                        speech_id=speech_handle.id, instructions=instructions, message=copy_msg
-                    )
+                    AgentFalseInterruptionEvent(extra_instructions=instructions, message=copy_msg)
                 )
 
             if self._session.agent_state == "speaking":
@@ -1971,9 +1966,7 @@ class AgentActivity(RecognitionHooks):
 
                 if speech_handle._interrupted_by_user:
                     self._session._schedule_agent_false_interruption(
-                        AgentFalseInterruptedEvent(
-                            speech_id=speech_handle.id, instructions=instructions, message=msg
-                        )
+                        AgentFalseInterruptionEvent(extra_instructions=instructions, message=msg)
                     )
 
             speech_handle._mark_generation_done()
