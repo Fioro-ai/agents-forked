@@ -185,22 +185,24 @@ class LLM(llm.LLM):
 
         # add cache control
         if self._opts.caching == "ephemeral":
+            # Always set cache control on system prompt
             if extra.get("system"):
                 extra["system"][-1]["cache_control"] = CACHE_CONTROL_EPHEMERAL
 
-            seen_assistant = False
-            for msg in reversed(messages):
-                if (
-                    msg["role"] == "assistant"
-                    and (content := msg["content"])
-                    and not seen_assistant
-                ):
-                    content[-1]["cache_control"] = CACHE_CONTROL_EPHEMERAL  # type: ignore
-                    seen_assistant = True
-
-                elif msg["role"] == "user" and (content := msg["content"]) and seen_assistant:
-                    content[-1]["cache_control"] = CACHE_CONTROL_EPHEMERAL  # type: ignore
-                    break
+            # Count assistant messages and set cache breakpoints every 5th assistant message
+            # with a maximum of 4 breakpoints total (including the system prompt breakpoint)
+            assistant_count = 0
+            breakpoints_set = 1 if extra.get("system") else 0  # Start at 1 if system prompt exists
+            max_breakpoints = 4
+            
+            for msg in messages:
+                if msg["role"] == "assistant" and (content := msg["content"]):
+                    assistant_count += 1
+                    
+                    # Set breakpoint every 5th assistant message, up to max_breakpoints
+                    if assistant_count % 5 == 0 and breakpoints_set < max_breakpoints:
+                        content[-1]["cache_control"] = CACHE_CONTROL_EPHEMERAL  # type: ignore
+                        breakpoints_set += 1
 
         stream = self._client.messages.create(
             messages=messages,
@@ -306,8 +308,6 @@ class LLMStream(llm.LLMStream):
                 self._cache_creation_tokens = event.message.usage.cache_creation_input_tokens
             if event.message.usage.cache_read_input_tokens:
                 self._cache_read_tokens = event.message.usage.cache_read_input_tokens
-
-                print("cache_read_input_tokens", self._cache_read_tokens)
         elif event.type == "message_delta":
             self._output_tokens += event.usage.output_tokens
         elif event.type == "content_block_start":
