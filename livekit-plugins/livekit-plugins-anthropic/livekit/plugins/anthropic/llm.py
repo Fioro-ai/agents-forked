@@ -190,10 +190,10 @@ class LLM(llm.LLM):
                 extra["system"][-1]["cache_control"] = CACHE_CONTROL_EPHEMERAL
 
             # Count assistant messages and set cache breakpoints every 5th assistant message
-            # with a maximum of 4 breakpoints total (including the system prompt breakpoint)
+            # with a maximum of 3 breakpoints total (including the system prompt breakpoint)
             assistant_count = 0
-            breakpoints_set = 1 if extra.get("system") else 0  # Start at 1 if system prompt exists
-            max_breakpoints = 4
+            breakpoints_set = 1 
+            max_breakpoints = 3
             
             for msg in messages:
                 if msg["role"] == "assistant" and (content := msg["content"]):
