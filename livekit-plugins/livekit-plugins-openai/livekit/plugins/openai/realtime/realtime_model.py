@@ -74,6 +74,7 @@ from openai.types.beta.realtime.session import (
 )
 
 from ..log import logger
+from ..models import RealtimeModels
 
 # When a response is created with the OpenAI Realtime API, those events are sent in this order:
 # 1. response.created (contains resp_id)
@@ -179,7 +180,7 @@ class RealtimeModel(llm.RealtimeModel):
     def __init__(
         self,
         *,
-        model: str = "gpt-4o-realtime-preview",
+        model: RealtimeModels | str = "gpt-realtime",
         voice: str = "alloy",
         modalities: NotGivenOr[list[Literal["text", "audio"]]] = NOT_GIVEN,
         input_audio_transcription: NotGivenOr[InputAudioTranscription | None] = NOT_GIVEN,
@@ -601,9 +602,8 @@ class RealtimeSession(
 
         reconnecting = False
         while not self._msg_ch.closed:
-            ws_conn = await self._create_ws_conn()
-
             try:
+                ws_conn = await self._create_ws_conn()
                 if reconnecting:
                     await _reconnect()
                     num_retries = 0  # reset the retry counter
@@ -661,10 +661,15 @@ class RealtimeSession(
         if lk_oai_debug:
             logger.debug(f"connecting to Realtime API: {url}")
 
-        return await asyncio.wait_for(
-            self._realtime_model._ensure_http_session().ws_connect(url=url, headers=headers),
-            self._realtime_model._opts.conn_options.timeout,
-        )
+        try:
+            return await asyncio.wait_for(
+                self._realtime_model._ensure_http_session().ws_connect(url=url, headers=headers),
+                self._realtime_model._opts.conn_options.timeout,
+            )
+        except asyncio.TimeoutError as e:
+            raise APIConnectionError(
+                message="OpenAI Realtime API connection timed out",
+            ) from e
 
     async def _run_ws(self, ws_conn: aiohttp.ClientWebSocketResponse) -> None:
         closing = False
@@ -811,6 +816,7 @@ class RealtimeSession(
             if wait_reconnect_task and wait_reconnect_task in done and self._current_generation:
                 # wait for the current generation to complete before reconnecting
                 await self._current_generation._done_fut
+                closing = True
 
         finally:
             await utils.aio.cancel_and_wait(*tasks)
