@@ -94,6 +94,7 @@ class TTS(tts.TTS):
         http_session: aiohttp.ClientSession | None = None,
         language: NotGivenOr[str] = NOT_GIVEN,
         sync_alignment: bool = True,
+        enable_logging: bool = False,  #custom
     ) -> None:
         """
         Create a new instance of ElevenLabs TTS.
@@ -113,6 +114,7 @@ class TTS(tts.TTS):
             http_session (aiohttp.ClientSession | None): Custom HTTP session for API requests. Optional.
             language (NotGivenOr[str]): Language code for the TTS model, as of 10/24/24 only valid for "eleven_turbo_v2_5".
             sync_alignment (bool): Enable sync alignment for the TTS model. Defaults to True.
+            enable_logging (bool): Enable logging for the TTS model. Defaults to False. #custom
         """  # noqa: E501
 
         if not is_given(encoding):
@@ -164,6 +166,7 @@ class TTS(tts.TTS):
             inactivity_timeout=inactivity_timeout,
             sync_alignment=sync_alignment,
             auto_mode=auto_mode,
+            enable_logging=enable_logging,  #custom
         )
         self._session = http_session
         self._streams = weakref.WeakSet[SynthesizeStream]()
@@ -446,6 +449,7 @@ class _TTSOptions:
     inactivity_timeout: int
     sync_alignment: bool
     auto_mode: NotGivenOr[bool]
+    enable_logging: bool  #custom
 
 
 @dataclass
