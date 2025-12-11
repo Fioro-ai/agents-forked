@@ -16,6 +16,8 @@ from livekit.agents.llm.tool_context import (
     is_function_tool,
     is_raw_function_tool,
 )
+from livekit.agents.types import NOT_GIVEN, NotGivenOr
+from livekit.agents.utils import is_given
 
 from .log import logger
 from .tools import _LLMTool
@@ -24,7 +26,10 @@ __all__ = ["to_fnc_ctx"]
 
 
 def to_fnc_ctx(
-    fncs: list[FunctionTool | RawFunctionTool], *, use_parameters_json_schema: bool = True
+    fncs: list[FunctionTool | RawFunctionTool],
+    *,
+    use_parameters_json_schema: bool = True,
+    tool_behavior: NotGivenOr[types.Behavior] = NOT_GIVEN,
 ) -> list[types.FunctionDeclaration]:
     tools: list[types.FunctionDeclaration] = []
     for fnc in fncs:
@@ -43,10 +48,13 @@ def to_fnc_ctx(
                         info.raw_schema.get("parameters", {})
                     )
                 )
+
+            if is_given(tool_behavior):
+                fnc_kwargs["behavior"] = tool_behavior
             tools.append(types.FunctionDeclaration(**fnc_kwargs))
 
         elif is_function_tool(fnc):
-            tools.append(_build_gemini_fnc(fnc))
+            tools.append(_build_gemini_fnc(fnc, tool_behavior=tool_behavior))
 
     return tools
 
@@ -88,7 +96,10 @@ def create_tools_config(
 
 
 def get_tool_results_for_realtime(
-    chat_ctx: llm.ChatContext, *, vertexai: bool = False
+    chat_ctx: llm.ChatContext,
+    *,
+    vertexai: bool = False,
+    tool_response_scheduling: NotGivenOr[types.FunctionResponseScheduling] = NOT_GIVEN,
 ) -> types.LiveClientToolResponse | None:
     function_responses: list[types.FunctionResponse] = []
     for msg in chat_ctx.items:
@@ -97,6 +108,10 @@ def get_tool_results_for_realtime(
                 name=msg.name,
                 response={"output": msg.output},
             )
+            if is_given(tool_response_scheduling):
+                # vertexai currently doesn't support the scheduling parameter, gemini api defaults to idle
+                # it's the user's responsibility to avoid this parameter when using vertexai
+                res.scheduling = tool_response_scheduling
             if not vertexai:
                 # vertexai does not support id in FunctionResponse
                 # see: https://github.com/googleapis/python-genai/blob/85e00bc/google/genai/_live_converters.py#L1435
@@ -109,99 +124,20 @@ def get_tool_results_for_realtime(
     )
 
 
-def to_chat_ctx(
-    chat_ctx: llm.ChatContext,
-    cache_key: Any,
-    ignore_functions: bool = False,
-    generate: bool = False,
-) -> tuple[list[types.Content], types.Content | None]:
-    turns: list[types.Content] = []
-    system_instruction: types.Content | None = None
-    current_role: str | None = None
-    parts: list[types.Part] = []
-
-    for msg in chat_ctx.items:
-        if msg.type == "message" and msg.role == "system":
-            sys_parts = []
-            for content in msg.content:
-                if content and isinstance(content, str):
-                    sys_parts.append(types.Part(text=content))
-            system_instruction = types.Content(parts=sys_parts)
-            continue
-
-        if msg.type == "message":
-            role = "model" if msg.role == "assistant" else "user"
-        elif msg.type == "function_call":
-            role = "model"
-        elif msg.type == "function_call_output":
-            role = "user"
-
-        # if the effective role changed, finalize the previous turn.
-        if role != current_role:
-            if current_role is not None and parts:
-                turns.append(types.Content(role=current_role, parts=parts))
-            parts = []
-            current_role = role
-
-        if msg.type == "message":
-            for content in msg.content:
-                if content and isinstance(content, str):
-                    parts.append(types.Part(text=content))
-                elif content and isinstance(content, dict):
-                    parts.append(types.Part(text=json.dumps(content)))
-                elif isinstance(content, llm.ImageContent):
-                    parts.append(_to_image_part(content, cache_key))
-        elif msg.type == "function_call" and not ignore_functions:
-            parts.append(
-                types.Part(
-                    function_call=types.FunctionCall(
-                        name=msg.name,
-                        args=json.loads(msg.arguments),
-                    )
-                )
-            )
-        elif msg.type == "function_call_output" and not ignore_functions:
-            parts.append(
-                types.Part(
-                    function_response=types.FunctionResponse(
-                        name=msg.name,
-                        response={"text": msg.output},
-                    )
-                )
-            )
-
-    if current_role is not None and parts:
-        turns.append(types.Content(role=current_role, parts=parts))
-
-    # Gemini requires the last message to end with user's turn before they can generate
-    #if generate and current_role != "user":
-    #    turns.append(types.Content(role="user", parts=[types.Part(text=".")]))
-
-    return turns, system_instruction
-
-
-def _to_image_part(image: llm.ImageContent, cache_key: Any) -> types.Part:
-    img = llm.utils.serialize_image(image)
-    if img.external_url:
-        if img.mime_type:
-            mime_type = img.mime_type
-        else:
-            logger.debug("No media type provided for image, defaulting to image/jpeg.")
-            mime_type = "image/jpeg"
-        return types.Part.from_uri(file_uri=img.external_url, mime_type=mime_type)
-    if cache_key not in image._cache:
-        image._cache[cache_key] = img.data_bytes
-    return types.Part.from_bytes(data=image._cache[cache_key], mime_type=img.mime_type)
-
-
-def _build_gemini_fnc(function_tool: FunctionTool) -> types.FunctionDeclaration:
+def _build_gemini_fnc(
+    function_tool: FunctionTool, *, tool_behavior: NotGivenOr[types.Behavior] = NOT_GIVEN
+) -> types.FunctionDeclaration:
     fnc = llm.utils.build_legacy_openai_schema(function_tool, internally_tagged=True)
     json_schema = _GeminiJsonSchema(fnc["parameters"]).simplify()
-    return types.FunctionDeclaration(
-        name=fnc["name"],
-        description=fnc["description"],
-        parameters=types.Schema.model_validate(json_schema) if json_schema else None,
-    )
+
+    kwargs = {
+        "name": fnc["name"],
+        "description": fnc["description"],
+        "parameters": types.Schema.model_validate(json_schema) if json_schema else None,
+    }
+    if is_given(tool_behavior):
+        kwargs["behavior"] = tool_behavior
+    return types.FunctionDeclaration(**kwargs)
 
 
 def to_response_format(response_format: type | dict) -> types.SchemaUnion:
@@ -265,6 +201,9 @@ class _GeminiJsonSchema:
             schema.update(schema_def)
             return
 
+        if "enum" in schema and "type" not in schema:
+            schema["type"] = self._infer_type(schema["enum"][0])
+
         # Convert type value to Gemini format
         if "type" in schema and schema["type"] != "null":
             json_type = schema["type"]
@@ -305,6 +244,18 @@ class _GeminiJsonSchema:
             self._object(schema, refs_stack)
         elif type_ == types.Type.ARRAY:
             self._array(schema, refs_stack)
+
+    def _infer_type(self, value: Any) -> str:
+        if isinstance(value, int):
+            return "integer"
+        elif isinstance(value, float):
+            return "number"
+        elif isinstance(value, str):
+            return "string"
+        elif isinstance(value, bool):
+            return "boolean"
+        else:
+            raise ValueError(f"Unsupported type in Schema: {type(value)}")
 
     def _map_field_names(self, schema: dict[str, Any]) -> None:
         """Map JSON Schema field names to Gemini Schema field names."""

@@ -100,26 +100,26 @@ class LLM(llm.LLM):
         if not anthropic_api_key:
             raise ValueError("Anthropic API key is required")
 
-        if client:
-            self._client = client
-        else:
-            self._client = anthropic.AsyncClient(
-                api_key=anthropic_api_key,
-                base_url=base_url if is_given(base_url) else None,
-                http_client=httpx.AsyncClient(
-                    timeout=5.0,
-                    follow_redirects=True,
-                    limits=httpx.Limits(
-                        max_connections=1000,
-                        max_keepalive_connections=100,
-                        keepalive_expiry=120,
-                    ),
+        self._client = client or anthropic.AsyncClient(
+            api_key=anthropic_api_key,
+            base_url=base_url if is_given(base_url) else None,
+            http_client=httpx.AsyncClient(
+                timeout=5.0,
+                follow_redirects=True,
+                limits=httpx.Limits(
+                    max_connections=1000,
+                    max_keepalive_connections=100,
+                    keepalive_expiry=120,
                 ),
             )
 
     @property
     def model(self) -> str:
         return self._opts.model
+
+    @property
+    def provider(self) -> str:
+        return self._client._base_url.netloc.decode("utf-8")
 
     def chat(
         self,

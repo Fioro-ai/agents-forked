@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 
+import httpx
 import openai
 from openai.types import ReasoningEffort
 
@@ -30,7 +31,12 @@ class LLM(OpenAILLM):
         parallel_tool_calls: NotGivenOr[bool] = NOT_GIVEN,
         tool_choice: NotGivenOr[ToolChoice] = NOT_GIVEN,
         base_url: NotGivenOr[str] = "https://api.groq.com/openai/v1",
+        metadata: NotGivenOr[dict[str, str]] = NOT_GIVEN,
+        max_completion_tokens: NotGivenOr[int] = NOT_GIVEN,
         reasoning_effort: NotGivenOr[ReasoningEffort] = NOT_GIVEN,
+        service_tier: NotGivenOr[str] = NOT_GIVEN,
+        timeout: httpx.Timeout | None = None,
+        max_retries: NotGivenOr[int] = NOT_GIVEN,
         client: openai.AsyncClient | None = None,
     ):
         """
@@ -44,7 +50,7 @@ class LLM(OpenAILLM):
             if model in ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]:
                 reasoning_effort = "low"
             elif model in ["qwen/qwen3-32b"]:
-                reasoning_effort = "none"  # type: ignore
+                reasoning_effort = "none"  # type: ignore[assignment]
 
         super().__init__(
             model=model,
@@ -59,6 +65,11 @@ class LLM(OpenAILLM):
             parallel_tool_calls=parallel_tool_calls,
             tool_choice=tool_choice,
             reasoning_effort=reasoning_effort,
+            service_tier=service_tier,
+            timeout=timeout,
+            max_retries=max_retries,
+            metadata=metadata,
+            max_completion_tokens=max_completion_tokens,
         )
 
 

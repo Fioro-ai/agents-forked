@@ -7,23 +7,27 @@ from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from livekit import rtc
 
-from .. import llm, stt, tokenize, tts, utils, vad
+from .. import inference, llm, stt, tokenize, tts, utils, vad
 from ..llm import (
     ChatContext,
     FunctionTool,
     RawFunctionTool,
+    RealtimeModel,
     find_function_tools,
 )
 from ..llm.chat_context import _ReadOnlyChatContext
+from ..llm.tool_context import is_function_tool, is_raw_function_tool
 from ..log import logger
-from ..types import NOT_GIVEN, NotGivenOr
-from ..utils import is_given
+from ..types import NOT_GIVEN, FlushSentinel, NotGivenOr
+from ..utils import is_given, misc
 from .speech_handle import SpeechHandle
 
 if TYPE_CHECKING:
+    from ..inference import LLMModels, STTModels, TTSModels
     from ..llm import mcp
     from .agent_activity import AgentActivity
-    from .agent_session import AgentSession, TurnDetectionMode
+    from .agent_session import AgentSession
+    from .audio_recognition import TurnDetectionMode
     from .io import TimedString
 
 
@@ -38,13 +42,14 @@ class Agent:
         self,
         *,
         instructions: str,
+        id: str | None = None,
         chat_ctx: NotGivenOr[llm.ChatContext | None] = NOT_GIVEN,
         tools: list[llm.FunctionTool | llm.RawFunctionTool] | None = None,
         turn_detection: NotGivenOr[TurnDetectionMode | None] = NOT_GIVEN,
-        stt: NotGivenOr[stt.STT | None] = NOT_GIVEN,
+        stt: NotGivenOr[stt.STT | STTModels | str | None] = NOT_GIVEN,
         vad: NotGivenOr[vad.VAD | None] = NOT_GIVEN,
-        llm: NotGivenOr[llm.LLM | llm.RealtimeModel | None] = NOT_GIVEN,
-        tts: NotGivenOr[tts.TTS | None] = NOT_GIVEN,
+        llm: NotGivenOr[llm.LLM | llm.RealtimeModel | LLMModels | str | None] = NOT_GIVEN,
+        tts: NotGivenOr[tts.TTS | TTSModels | str | None] = NOT_GIVEN,
         mcp_servers: NotGivenOr[list[mcp.MCPServer] | None] = NOT_GIVEN,
         allow_interruptions: NotGivenOr[bool] = NOT_GIVEN,
         min_consecutive_speech_delay: NotGivenOr[float] = NOT_GIVEN,
@@ -53,10 +58,25 @@ class Agent:
         max_endpointing_delay: NotGivenOr[float] = NOT_GIVEN,
     ) -> None:
         tools = tools or []
+        if type(self) is Agent:
+            self._id = "default_agent"
+        else:
+            self._id = id or misc.camel_to_snake_case(type(self).__name__)
+
         self._instructions = instructions
         self._tools = tools.copy() + find_function_tools(self)
         self._chat_ctx = chat_ctx.copy(tools=self._tools) if chat_ctx else ChatContext.empty()
         self._turn_detection = turn_detection
+
+        if isinstance(stt, str):
+            stt = inference.STT.from_model_string(stt)
+
+        if isinstance(llm, str):
+            llm = inference.LLM.from_model_string(llm)
+
+        if isinstance(tts, str):
+            tts = inference.TTS.from_model_string(tts)
+
         self._stt = stt
         self._llm = llm
         self._tts = tts
@@ -74,12 +94,12 @@ class Agent:
         self._activity: AgentActivity | None = None
 
     @property
+    def id(self) -> str:
+        return self._id
+
+    @property
     def label(self) -> str:
-        """
-        Returns:
-            str: The label of the agent.
-        """
-        return f"{type(self).__module__}.{type(self).__name__}"
+        return self.id
 
     @property
     def instructions(self) -> str:
@@ -145,6 +165,13 @@ class Agent:
         Raises:
             llm.RealtimeError: If updating the realtime session tools fails.
         """
+        invalid = [t for t in tools if not (is_function_tool(t) or is_raw_function_tool(t))]
+        if invalid:
+            kinds = ", ".join(sorted({type(t).__name__ for t in invalid}))
+            raise TypeError(
+                f"Invalid tool type(s): {kinds}. Expected FunctionTool or RawFunctionTool."
+            )
+
         if self._activity is None:
             self._tools = list(set(tools))
             self._chat_ctx = self._chat_ctx.copy(tools=self._tools)
@@ -152,7 +179,9 @@ class Agent:
 
         await self._activity.update_tools(tools)
 
-    async def update_chat_ctx(self, chat_ctx: llm.ChatContext) -> None:
+    async def update_chat_ctx(
+        self, chat_ctx: llm.ChatContext, *, exclude_invalid_function_calls: bool = True
+    ) -> None:
         """
         Updates the agent's chat context.
 
@@ -162,15 +191,21 @@ class Agent:
         Args:
             chat_ctx (llm.ChatContext):
                 The new or updated chat context for the agent.
+            exclude_invalid_function_calls (bool): Whether to exclude function calls
+                and outputs not from the agent's tools.
 
         Raises:
             llm.RealtimeError: If updating the realtime session chat context fails.
         """
         if self._activity is None:
-            self._chat_ctx = chat_ctx.copy(tools=self._tools)
+            self._chat_ctx = chat_ctx.copy(
+                tools=self._tools if exclude_invalid_function_calls else NOT_GIVEN
+            )
             return
 
-        await self._activity.update_chat_ctx(chat_ctx)
+        await self._activity.update_chat_ctx(
+            chat_ctx, exclude_invalid_function_calls=exclude_invalid_function_calls
+        )
 
     # -- Pipeline nodes --
     # They can all be overriden by subclasses, by default they use the STT/LLM/TTS specified in the
@@ -226,8 +261,8 @@ class Agent:
         tools: list[FunctionTool | RawFunctionTool],
         model_settings: ModelSettings,
     ) -> (
-        AsyncIterable[llm.ChatChunk | str]
-        | Coroutine[Any, Any, AsyncIterable[llm.ChatChunk | str]]
+        AsyncIterable[llm.ChatChunk | str | FlushSentinel]
+        | Coroutine[Any, Any, AsyncIterable[llm.ChatChunk | str | FlushSentinel]]
         | Coroutine[Any, Any, str]
         | Coroutine[Any, Any, llm.ChatChunk]
         | Coroutine[Any, Any, None]
@@ -364,7 +399,7 @@ class Agent:
             chat_ctx: llm.ChatContext,
             tools: list[FunctionTool | RawFunctionTool],
             model_settings: ModelSettings,
-        ) -> AsyncGenerator[llm.ChatChunk | str, None]:
+        ) -> AsyncGenerator[llm.ChatChunk | str | FlushSentinel, None]:
             """Default implementation for `Agent.llm_node`"""
             activity = agent._get_activity_or_raise()
             assert activity.llm is not None, "llm_node called but no LLM node is available"
@@ -460,6 +495,13 @@ class Agent:
             NotGivenOr[TurnDetectionMode | None]: An optional turn detection mode for managing conversation flow.
         """  # noqa: E501
         return self._turn_detection
+
+    @turn_detection.setter
+    def turn_detection(self, value: TurnDetectionMode | None) -> None:
+        self._turn_detection = value
+
+        if self._activity is not None:
+            self._activity.update_options(turn_detection=value)
 
     @property
     def stt(self) -> NotGivenOr[stt.STT | None]:
@@ -717,10 +759,26 @@ class AgentTask(Agent, Generic[TaskResult_T]):
         old_agent = old_activity.agent
         session = old_activity.session
 
+        blocked_tasks = [current_task]
+        if (
+            old_activity._on_enter_task
+            and not old_activity._on_enter_task.done()
+            and current_task is not old_activity._on_enter_task
+        ):
+            blocked_tasks.append(old_activity._on_enter_task)
+
+        if (
+            task_info.function_call
+            and isinstance(old_activity.llm, RealtimeModel)
+            and not old_activity.llm.capabilities.manual_function_calls
+        ):
+            logger.error(
+                f"Realtime model '{old_activity.llm.label}' does not support resuming function calls from chat context, "
+                "using AgentTask inside a function tool may have unexpected behavior."
+            )
+
         # TODO(theomonnom): could the RunResult watcher & the blocked_tasks share the same logic?
-        await session._update_activity(
-            self, previous_activity="pause", blocked_tasks=[current_task]
-        )
+        await session._update_activity(self, previous_activity="pause", blocked_tasks=blocked_tasks)
 
         # NOTE: _update_activity is calling the on_enter method, so the RunResult can capture all speeches
         run_state = session._global_run_state

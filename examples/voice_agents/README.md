@@ -14,11 +14,12 @@ This directory contains a comprehensive collection of voice-based agent examples
 - [`dynamic_tool_creation.py`](./dynamic_tool_creation.py) - Creating and registering tools dynamically at runtime
 - [`raw_function_description.py`](./raw_function_description.py) - Using raw JSON schema definitions for tool descriptions
 - [`silent_function_call.py`](./silent_function_call.py) - Executing function calls without verbal responses to user
+- [`long_running_function.py`](./long_running_function.py) - Handling long running function calls with interruption support
 
 ### ⚡ Real-time Models
 
 - [`weather_agent.py`](./weather_agent.py) - OpenAI Realtime API with function calls for weather information
-- [`gemini_video_agent.py`](./gemini_video_agent.py) - Google Gemini with multimodal video and voice capabilities
+- [`realtime_video_agent.py`](./realtime_video_agent.py) - Google Gemini with multimodal video and voice capabilities
 - [`realtime_joke_teller.py`](./realtime_joke_teller.py) - Amazon Nova Sonic real-time model with function calls
 - [`realtime_load_chat_history.py`](./realtime_load_chat_history.py) - Loading previous chat history into real-time models
 - [`realtime_turn_detector.py`](./realtime_turn_detector.py) - Using LiveKit's turn detection with real-time models
@@ -27,6 +28,7 @@ This directory contains a comprehensive collection of voice-based agent examples
 ### 🎯 Pipeline Nodes & Hooks
 
 - [`fast-preresponse.py`](./fast-preresponse.py) - Generating quick responses using the `on_user_turn_completed` node
+- [`flush_llm_node.py`](./flush_llm_node.py) - Flushing partial LLM output to TTS in `llm_node`
 - [`structured_output.py`](./structured_output.py) - Structured data and JSON outputs from agent responses
 - [`speedup_output_audio.py`](./speedup_output_audio.py) - Dynamically adjusting agent audio playback speed
 - [`timed_agent_transcript.py`](./timed_agent_transcript.py) - Reading timestamped transcripts from `transcription_node`
