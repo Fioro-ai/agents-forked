@@ -162,6 +162,7 @@ class FallbackLLMStream(LLMStream):
                           result will not be used. Recovery checks verify if a previously
                           failed LLM has become available again.
         """
+        has_received_first_chunk = False
         try:
             async with llm.chat(
                 chat_ctx=self._chat_ctx,
@@ -179,6 +180,9 @@ class FallbackLLMStream(LLMStream):
             ) as stream:
                 should_set_current = not check_recovery
                 async for chunk in stream:
+                    if not has_received_first_chunk:
+                        has_received_first_chunk = True
+                        self._llm.emit("first_token_received")
                     if should_set_current:
                         should_set_current = False
                         self._current_stream = stream
