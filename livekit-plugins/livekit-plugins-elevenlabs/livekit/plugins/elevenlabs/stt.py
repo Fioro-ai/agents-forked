@@ -64,6 +64,7 @@ class STTOptions:
     tag_audio_events: bool
     sample_rate: STTRealtimeSampleRates
     server_vad: NotGivenOr[VADOptions | None]
+    enable_logging: bool
 
 
 class STT(stt.STT):
@@ -77,6 +78,7 @@ class STT(stt.STT):
         use_realtime: bool = False,
         sample_rate: STTRealtimeSampleRates = 16000,
         server_vad: NotGivenOr[VADOptions] = NOT_GIVEN,
+        enable_logging: bool = False,
         http_session: aiohttp.ClientSession | None = None,
     ) -> None:
         """
@@ -91,6 +93,7 @@ class STT(stt.STT):
             use_realtime (bool): Whether to use "scribe_v2_realtime" model for streaming mode. Default is False.
             sample_rate (STTRealtimeSampleRates): Audio sample rate in Hz. Default is 16000.
             server_vad (NotGivenOr[VADOptions]): Server-side VAD options, only supported for Scribe v2 realtime model.
+            enable_logging (bool): Whether to enable logging for the STT model. Default is False.
             http_session (aiohttp.ClientSession | None): Custom HTTP session for API requests. Optional.
         """  # noqa: E501
 
@@ -112,6 +115,7 @@ class STT(stt.STT):
             tag_audio_events=tag_audio_events,
             sample_rate=sample_rate,
             server_vad=server_vad,
+            enable_logging=enable_logging,
         )
         self._session = http_session
         self._streams = weakref.WeakSet[SpeechStream]()
@@ -145,6 +149,7 @@ class STT(stt.STT):
         form.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/x-wav")
         form.add_field("model_id", "scribe_v1")
         form.add_field("tag_audio_events", str(self._opts.tag_audio_events).lower())
+        form.add_field("enable_logging", str(self._opts.enable_logging).lower())
         if self._opts.language_code:
             form.add_field("language_code", self._opts.language_code)
 
@@ -388,6 +393,7 @@ class SpeechStream(stt.SpeechStream):
             "model_id=scribe_v2_realtime",
             f"encoding=pcm_{self._opts.sample_rate}",
             f"commit_strategy={commit_strategy}",
+            f"enable_logging={str(self._opts.enable_logging).lower()}",
         ]
 
         if server_vad := self._opts.server_vad:
