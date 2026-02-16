@@ -25,7 +25,7 @@ import anthropic
 from livekit.agents import APIConnectionError, APIStatusError, APITimeoutError, llm
 from livekit.agents.llm import ToolChoice
 from livekit.agents.llm.chat_context import ChatContext
-from livekit.agents.llm.tool_context import FunctionTool, RawFunctionTool
+from livekit.agents.llm.tool_context import Tool
 from livekit.agents.types import (
     DEFAULT_API_CONNECT_OPTIONS,
     NOT_GIVEN,
@@ -35,7 +35,7 @@ from livekit.agents.types import (
 from livekit.agents.utils import is_given
 
 from .models import ChatModels
-from .utils import CACHE_CONTROL_EPHEMERAL, to_fnc_ctx
+from .utils import CACHE_CONTROL_EPHEMERAL
 
 
 @dataclass
@@ -98,7 +98,10 @@ class LLM(llm.LLM):
         )
         anthropic_api_key = api_key if is_given(api_key) else os.environ.get("ANTHROPIC_API_KEY")
         if not anthropic_api_key:
-            raise ValueError("Anthropic API key is required")
+            raise ValueError(
+                "Anthropic API key is required, either as argument or set"
+                " ANTHROPIC_API_KEY environment variable"
+            )
 
         self._client = client or anthropic.AsyncClient(
             api_key=anthropic_api_key,
@@ -111,7 +114,8 @@ class LLM(llm.LLM):
                     max_keepalive_connections=100,
                     keepalive_expiry=120,
                 ),
-            )
+            ),
+        )
 
     @property
     def model(self) -> str:
@@ -125,7 +129,7 @@ class LLM(llm.LLM):
         self,
         *,
         chat_ctx: ChatContext,
-        tools: list[FunctionTool | RawFunctionTool] | None = None,
+        tools: list[Tool] | None = None,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
         parallel_tool_calls: NotGivenOr[bool] = NOT_GIVEN,
         tool_choice: NotGivenOr[ToolChoice] = NOT_GIVEN,
@@ -148,7 +152,7 @@ class LLM(llm.LLM):
         extra["max_tokens"] = self._opts.max_tokens if is_given(self._opts.max_tokens) else 1024
 
         if tools:
-            extra["tools"] = to_fnc_ctx(tools, self._opts.caching or None)
+            extra["tools"] = llm.ToolContext(tools).parse_function_tools("anthropic")
             tool_choice = (
                 cast(ToolChoice, tool_choice) if is_given(tool_choice) else self._opts.tool_choice
             )
@@ -185,24 +189,25 @@ class LLM(llm.LLM):
 
         # add cache control
         if self._opts.caching == "ephemeral":
-            # Always set cache control on system prompt
             if extra.get("system"):
                 extra["system"][-1]["cache_control"] = CACHE_CONTROL_EPHEMERAL
 
-            # Count assistant messages and set cache breakpoints every 5th assistant message
-            # with a maximum of 3 breakpoints total (including the system prompt breakpoint)
-            assistant_count = 0
-            breakpoints_set = 1 
-            max_breakpoints = 3
-            
-            for msg in messages:
-                if msg["role"] == "assistant" and (content := msg["content"]):
-                    assistant_count += 1
-                    
-                    # Set breakpoint every 5th assistant message, up to max_breakpoints
-                    if assistant_count % 5 == 0 and breakpoints_set < max_breakpoints:
-                        content[-1]["cache_control"] = CACHE_CONTROL_EPHEMERAL  # type: ignore
-                        breakpoints_set += 1
+            if extra.get("tools"):
+                extra["tools"][-1]["cache_control"] = CACHE_CONTROL_EPHEMERAL
+
+            seen_assistant = False
+            for msg in reversed(messages):
+                if (
+                    msg["role"] == "assistant"
+                    and (content := msg["content"])
+                    and not seen_assistant
+                ):
+                    content[-1]["cache_control"] = CACHE_CONTROL_EPHEMERAL  # type: ignore
+                    seen_assistant = True
+
+                elif msg["role"] == "user" and (content := msg["content"]) and seen_assistant:
+                    content[-1]["cache_control"] = CACHE_CONTROL_EPHEMERAL  # type: ignore
+                    break
 
         stream = self._client.messages.create(
             messages=messages,
@@ -212,18 +217,12 @@ class LLM(llm.LLM):
             **extra,
         )
 
-        conn_options_override = APIConnectOptions(
-            max_retry=3,
-            retry_interval=0.1,
-            timeout=4
-        )
-
         return LLMStream(
             self,
             anthropic_stream=stream,
             chat_ctx=chat_ctx,
             tools=tools or [],
-            conn_options=conn_options_override,
+            conn_options=conn_options,
         )
 
 
@@ -234,7 +233,7 @@ class LLMStream(llm.LLMStream):
         *,
         anthropic_stream: Awaitable[anthropic.AsyncStream[anthropic.types.RawMessageStreamEvent]],
         chat_ctx: llm.ChatContext,
-        tools: list[FunctionTool | RawFunctionTool],
+        tools: list[Tool],
         conn_options: APIConnectOptions,
     ) -> None:
         super().__init__(llm, chat_ctx=chat_ctx, tools=tools, conn_options=conn_options)
@@ -299,7 +298,6 @@ class LLMStream(llm.LLMStream):
 
     def _parse_event(self, event: anthropic.types.RawMessageStreamEvent) -> llm.ChatChunk | None:
         if event.type == "message_start":
-            # custom
             self._llm.emit("first_token_received")
             self._request_id = event.message.id
             self._input_tokens = event.message.usage.input_tokens

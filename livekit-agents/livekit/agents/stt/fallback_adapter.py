@@ -192,6 +192,7 @@ class FallbackAdapter(
                         AvailabilityChangedEvent(stt=stt, available=True),
                     )
                 except Exception:
+                    logger.debug(f"{stt.label} recovery attempt failed", exc_info=True)
                     return
 
             stt_status.recovering_synthesize_task = asyncio.create_task(_recover_stt_task(stt))
@@ -433,4 +434,5 @@ class FallbackRecognizeStream(RecognizeStream):
             task.add_done_callback(lambda _: self._recovering_streams.remove(stream))
 
     async def _metrics_monitor_task(self, event_aiter: AsyncIterable[SpeechEvent]) -> None:
-        return
+        async for _ in event_aiter:
+            pass
