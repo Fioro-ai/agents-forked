@@ -18,6 +18,7 @@ import asyncio
 import dataclasses
 import json
 import os
+import time
 import weakref
 from collections import Counter
 from collections.abc import Sequence
@@ -33,6 +34,7 @@ from livekit.agents import (
     APIConnectOptions,
     APIStatusError,
     APITimeoutError,
+    LanguageCode,
     stt,
     utils,
 )
@@ -50,7 +52,7 @@ from .models import DeepgramLanguages, DeepgramModels
 
 @dataclass
 class STTOptions:
-    language: DeepgramLanguages | str | None
+    language: LanguageCode | None
     detect_language: bool
     interim_results: bool
     punctuate: bool
@@ -167,7 +169,7 @@ class STT(stt.STT):
         _validate_keyterm(model, language, keyterm, keywords)
 
         self._opts = STTOptions(
-            language=language,
+            language=LanguageCode(language) if language else None,
             detect_language=detect_language,
             interim_results=interim_results,
             punctuate=punctuate,
@@ -308,7 +310,7 @@ class STT(stt.STT):
         keyterms: NotGivenOr[list[str]] = NOT_GIVEN,
     ) -> None:
         if is_given(language):
-            self._opts.language = language
+            self._opts.language = LanguageCode(language)
         if is_given(model):
             self._opts.model = _validate_model(model, language)
         if is_given(interim_results):
@@ -378,7 +380,7 @@ class STT(stt.STT):
     ) -> STTOptions:
         config = dataclasses.replace(self._opts)
         if is_given(language):
-            config.language = language
+            config.language = LanguageCode(language)
 
         if config.detect_language:
             config.language = None
@@ -448,7 +450,7 @@ class SpeechStream(stt.SpeechStream):
         keyterms: NotGivenOr[list[str]] = NOT_GIVEN,
     ) -> None:
         if is_given(language):
-            self._opts.language = language
+            self._opts.language = LanguageCode(language)
         if is_given(model):
             self._opts.model = _validate_model(model, language)
         if is_given(interim_results):
@@ -642,6 +644,7 @@ class SpeechStream(stt.SpeechStream):
         if self._opts.replace:
             live_config["replace"] = self._opts.replace
 
+        t0 = time.perf_counter()
         try:
             ws = await asyncio.wait_for(
                 self._session.ws_connect(
@@ -650,6 +653,7 @@ class SpeechStream(stt.SpeechStream):
                 ),
                 self._conn_options.timeout,
             )
+            self._report_connection_acquired(time.perf_counter() - t0, False)
             ws_headers = {
                 k: v for k, v in ws._response.headers.items() if k.startswith("dg-") or k == "Date"
             }
@@ -753,7 +757,7 @@ def live_transcription_to_speech_data(
             speaker = None
 
         sd = stt.SpeechData(
-            language=language,
+            language=LanguageCode(language),
             start_time=next((word.get("start", 0) for word in alt["words"]), 0) + start_time_offset,
             end_time=next((word.get("end", 0) for word in alt["words"]), 0) + start_time_offset,
             confidence=alt["confidence"],
@@ -772,7 +776,7 @@ def live_transcription_to_speech_data(
             else None,
         )
         if language == "multi" and "languages" in alt:
-            sd.language = alt["languages"][0]  # TODO: handle multiple languages
+            sd.language = LanguageCode(alt["languages"][0])  # TODO: handle multiple languages
         speech_data.append(sd)
     return speech_data
 
@@ -788,14 +792,14 @@ def prerecorded_transcription_to_speech_event(
 
     # Use the detected language if enabled
     # https://developers.deepgram.com/docs/language-detection
-    detected_language = channel.get("detected_language", "")
+    detected_language = LanguageCode(channel.get("detected_language", ""))
 
     return stt.SpeechEvent(
         request_id=request_id,
         type=stt.SpeechEventType.FINAL_TRANSCRIPT,
         alternatives=[
             stt.SpeechData(
-                language=language or detected_language,
+                language=LanguageCode(language or detected_language),
                 start_time=alt["words"][0]["start"] if alt["words"] else 0,
                 end_time=alt["words"][-1]["end"] if alt["words"] else 0,
                 confidence=alt["confidence"],

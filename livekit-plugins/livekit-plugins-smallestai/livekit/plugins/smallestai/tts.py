@@ -25,6 +25,7 @@ from livekit.agents import (
     APIConnectionError,
     APIConnectOptions,
     APITimeoutError,
+    LanguageCode,
     create_api_error_from_http,
     tts,
     utils,
@@ -49,7 +50,7 @@ class _TTSOptions:
     consistency: float
     similarity: float
     enhancement: float
-    language: str
+    language: LanguageCode
     output_format: TTSEncoding | str
     base_url: str
 
@@ -75,7 +76,7 @@ class TTS(tts.TTS):
         Create a new instance of smallest.ai Waves TTS.
         Args:
             api_key: Your Smallest AI API key.
-            model: The TTS model to use (e.g., "lightning", "lightning-large", "lightning-v2").
+            model: The TTS model to use (e.g., "lightning", "lightning-large", "lightning-v2", "lightning-v3.1").
             voice_id: The voice ID to use for synthesis.
             sample_rate: Sample rate for the audio output.
             speed: Speed of the speech synthesis.
@@ -103,7 +104,7 @@ class TTS(tts.TTS):
 
         if (consistency or similarity or enhancement) and model == "lightning":
             logger.warning(
-                "consistency, similarity, and enhancement are only supported for model 'lightning-large' and 'lightning-v2'. "
+                "consistency, similarity, and enhancement are only supported for model 'lightning-large', 'lightning-v2', and 'lightning-v3.1'. "
             )
 
         self._opts = _TTSOptions(
@@ -115,7 +116,7 @@ class TTS(tts.TTS):
             consistency=consistency,
             similarity=similarity,
             enhancement=enhancement,
-            language=language,
+            language=LanguageCode(language),
             output_format=output_format,
             base_url=base_url,
         )
@@ -164,7 +165,7 @@ class TTS(tts.TTS):
         if is_given(enhancement):
             self._opts.enhancement = enhancement
         if is_given(language):
-            self._opts.language = language
+            self._opts.language = LanguageCode(language)
         if is_given(output_format):
             self._opts.output_format = output_format
 
@@ -195,9 +196,13 @@ class ChunkedStream(tts.ChunkedStream):
             data = _to_smallest_options(self._opts)
             data["text"] = self._input_text
 
-            url = f"{SMALLEST_BASE_URL}/{self._opts.model}/get_speech_long_text"
-            if self._opts.model == "lightning-v2":
-                url = f"{SMALLEST_BASE_URL}/{self._opts.model}/get_speech"
+            # lightning and lightning-large use /get_speech_long_text
+            # lightning-v2 and lightning-v3.1 use /get_speech
+            base = self._opts.base_url
+            if self._opts.model in ("lightning-v2", "lightning-v3.1"):
+                url = f"{base}/{self._opts.model}/get_speech"
+            else:
+                url = f"{base}/{self._opts.model}/get_speech_long_text"
 
             headers = {
                 "Authorization": f"Bearer {self._opts.api_key}",
@@ -236,4 +241,7 @@ def _to_smallest_options(opts: _TTSOptions) -> dict[str, Any]:
     extra_keys = ["consistency", "similarity", "enhancement"]
 
     keys = base_keys if opts.model == "lightning" else base_keys + extra_keys
-    return {key: getattr(opts, key) for key in keys}
+    result = {key: getattr(opts, key) for key in keys}
+    if "language" in result and isinstance(result["language"], LanguageCode):
+        result["language"] = result["language"].language
+    return result

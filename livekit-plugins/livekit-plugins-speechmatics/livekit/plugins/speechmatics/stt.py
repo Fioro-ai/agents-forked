@@ -23,6 +23,7 @@ from typing import Any
 from livekit.agents import (
     DEFAULT_API_CONNECT_OPTIONS,
     APIConnectOptions,
+    LanguageCode,
     stt,
     utils,
 )
@@ -60,7 +61,11 @@ class TurnDetectionMode(str, Enum):
     voice activity detection or `TurnDetectionMode.SMART_TURN` for more advanced ML-based
     endpointing.
 
-    The default is `ADAPTIVE` which uses voice activity detection to determine end of speech.
+    The `TurnDetectionMode.FIXED` mode uses a fixed amount of silence, as determined by the
+    `end_of_utterance_silence_trigger` parameter.
+
+    The default is `TurnDetectionMode.ADAPTIVE` which uses voice activity detection to determine
+    end of speech.
     """
 
     EXTERNAL = "external"
@@ -74,7 +79,7 @@ class STTOptions:
     """Configuration parameters for Speechmatics STT service."""
 
     # Service configuration
-    language: str = "en"
+    language: LanguageCode = LanguageCode("en")
     output_locale: str | None = None
     domain: str | None = None
 
@@ -157,6 +162,8 @@ class STT(stt.STT):
                 turns. Use `EXTERNAL` when turn boundaries are controlled manually,
                 for example via an external VAD or the `finalize()` method. Use
                 `ADAPTIVE` for simple VAD or `SMART_TURN` for ML-based endpointing.
+                `FIXED` uses a fixed amount of silence, as determined by the
+                `end_of_utterance_silence_trigger` parameter.
                 Defaults to `TurnDetectionMode.ADAPTIVE`.
 
             operating_point: Operating point for transcription accuracy vs. latency
@@ -262,7 +269,7 @@ class STT(stt.STT):
 
         # Create STT options from parameters
         self._stt_options = STTOptions(
-            language=language,
+            language=LanguageCode(language),
             output_locale=_set(output_locale),
             domain=_set(domain),
             turn_detection_mode=turn_detection_mode,
@@ -365,7 +372,7 @@ class STT(stt.STT):
         errors: list[str] = []
         opts = self._stt_options
 
-        # end_of_utterance_silence_trigger must be between 0 and 1
+        # end_of_utterance_silence_trigger must be between 0 and 2
         if opts.end_of_utterance_silence_trigger is not None and not (
             0 < opts.end_of_utterance_silence_trigger < 2
         ):
@@ -408,8 +415,8 @@ class STT(stt.STT):
         config.sample_rate = self._sample_rate
         config.audio_encoding = self._audio_encoding
 
-        # Language and domain
-        config.language = language if is_given(language) else opts.language
+        # LanguageCode and domain
+        config.language = LanguageCode(language) if is_given(language) else opts.language
         config.domain = opts.domain
         config.output_locale = opts.output_locale
 
@@ -815,7 +822,7 @@ class SpeechStream(stt.RecognizeStream):
 
             # Create speech event
             speech_data = stt.SpeechData(
-                language=segment.get("language", opts.language),
+                language=LanguageCode(segment.get("language", opts.language)),
                 text=text,
                 speaker_id=segment.get("speaker_id", "UU"),
                 start_time=segment.get("metadata", {}).get("start_time", 0)

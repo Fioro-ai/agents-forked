@@ -18,7 +18,7 @@ import os
 import weakref
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
 import azure.cognitiveservices.speech as speechsdk  # type: ignore
 from livekit import rtc
@@ -26,6 +26,7 @@ from livekit.agents import (
     DEFAULT_API_CONNECT_OPTIONS,
     APIConnectionError,
     APIConnectOptions,
+    LanguageCode,
     stt,
     utils,
 )
@@ -114,7 +115,9 @@ class STT(stt.STT):
             language = ["en-US"]
 
         if isinstance(language, str):
-            language = [language]
+            language = [LanguageCode(language)]
+        else:
+            language = [LanguageCode(lg) for lg in language]
 
         if not is_given(speech_host):
             speech_host = os.environ.get("AZURE_SPEECH_HOST") or NOT_GIVEN
@@ -183,19 +186,39 @@ class STT(stt.STT):
     ) -> SpeechStream:
         config = deepcopy(self._config)
         if is_given(language):
-            config.language = [language]
+            config.language = [LanguageCode(language)]
         stream = SpeechStream(stt=self, opts=config, conn_options=conn_options)
         self._streams.add(stream)
         return stream
 
-    def update_options(self, *, language: NotGivenOr[list[str] | str] = NOT_GIVEN) -> None:
+    def update_options(
+        self,
+        *,
+        language: NotGivenOr[list[str] | str] = NOT_GIVEN,
+        segmentation_silence_timeout_ms: NotGivenOr[int] = NOT_GIVEN,
+        segmentation_max_time_ms: NotGivenOr[int] = NOT_GIVEN,
+        segmentation_strategy: NotGivenOr[str] = NOT_GIVEN,
+    ) -> None:
         if is_given(language):
             if isinstance(language, str):
-                language = [language]
-            language = cast(list[str], language)
+                language = [LanguageCode(language)]
+            else:
+                language = [LanguageCode(lg) for lg in language]
             self._config.language = language
-            for stream in self._streams:
-                stream.update_options(language=language)
+        if is_given(segmentation_silence_timeout_ms):
+            self._config.segmentation_silence_timeout_ms = segmentation_silence_timeout_ms
+        if is_given(segmentation_max_time_ms):
+            self._config.segmentation_max_time_ms = segmentation_max_time_ms
+        if is_given(segmentation_strategy):
+            self._config.segmentation_strategy = segmentation_strategy
+
+        for stream in self._streams:
+            stream.update_options(
+                language=language,
+                segmentation_silence_timeout_ms=segmentation_silence_timeout_ms,
+                segmentation_max_time_ms=segmentation_max_time_ms,
+                segmentation_strategy=segmentation_strategy,
+            )
 
 
 class SpeechStream(stt.SpeechStream):
@@ -210,8 +233,22 @@ class SpeechStream(stt.SpeechStream):
         self._loop = asyncio.get_running_loop()
         self._reconnect_event = asyncio.Event()
 
-    def update_options(self, *, language: list[str]) -> None:
-        self._opts.language = language
+    def update_options(
+        self,
+        *,
+        language: NotGivenOr[list[str]] = NOT_GIVEN,
+        segmentation_silence_timeout_ms: NotGivenOr[int] = NOT_GIVEN,
+        segmentation_max_time_ms: NotGivenOr[int] = NOT_GIVEN,
+        segmentation_strategy: NotGivenOr[str] = NOT_GIVEN,
+    ) -> None:
+        if is_given(language):
+            self._opts.language = language
+        if is_given(segmentation_silence_timeout_ms):
+            self._opts.segmentation_silence_timeout_ms = segmentation_silence_timeout_ms
+        if is_given(segmentation_max_time_ms):
+            self._opts.segmentation_max_time_ms = segmentation_max_time_ms
+        if is_given(segmentation_strategy):
+            self._opts.segmentation_strategy = segmentation_strategy
         self._reconnect_event.set()
 
     async def _run(self) -> None:
@@ -278,13 +315,14 @@ class SpeechStream(stt.SpeechStream):
                 await asyncio.to_thread(_cleanup)
 
     def _on_recognized(self, evt: speechsdk.SpeechRecognitionEventArgs) -> None:
-        detected_lg = speechsdk.AutoDetectSourceLanguageResult(evt.result).language
+        res = speechsdk.AutoDetectSourceLanguageResult(evt.result)
+        detected_lg = LanguageCode(res.language or "")
         text = evt.result.text.strip()
         if not text:
             return
 
         if not detected_lg and self._opts.language:
-            detected_lg = self._opts.language[0]
+            detected_lg = LanguageCode(self._opts.language[0])
 
         # TODO: @chenghao-mou get confidence from NBest with `detailed` output format
         final_data = stt.SpeechData(
@@ -304,13 +342,14 @@ class SpeechStream(stt.SpeechStream):
             )
 
     def _on_recognizing(self, evt: speechsdk.SpeechRecognitionEventArgs) -> None:
-        detected_lg = speechsdk.AutoDetectSourceLanguageResult(evt.result).language
+        res = speechsdk.AutoDetectSourceLanguageResult(evt.result)
+        detected_lg = LanguageCode(res.language or "")
         text = evt.result.text.strip()
         if not text:
             return
 
         if not detected_lg and self._opts.language:
-            detected_lg = self._opts.language[0]
+            detected_lg = LanguageCode(self._opts.language[0])
 
         interim_data = stt.SpeechData(
             language=detected_lg,
@@ -417,7 +456,7 @@ def _create_speech_recognizer(
 
     kwargs: dict[str, Any] = {}
     if config.language and len(config.language) > 1:
-        # Enable Continuous Language ID for multiple languages
+        # Enable Continuous LanguageCode ID for multiple languages
         # This ensures language detection updates throughout the streaming session
         speech_config.set_property(
             speechsdk.PropertyId.SpeechServiceConnection_LanguageIdMode, "Continuous"
