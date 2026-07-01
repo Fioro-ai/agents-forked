@@ -105,8 +105,6 @@ class STT(stt.STT):
         base_url: str = "https://api.deepgram.com/v1/listen",
         numerals: bool = False,
         mip_opt_out: bool = False,
-        # custom
-        replace: NotGivenOr[list[str]] = NOT_GIVEN,
         vad_events: bool = True,
         utterance_end_ms: int | None = None,
         dictation: bool = False,
@@ -757,9 +755,6 @@ class SpeechStream(stt.SpeechStream):
             live_config["redact"] = self._opts.redact
         if self._opts.tags:
             live_config["tag"] = self._opts.tags
-
-        if self._opts.replace:
-            live_config["replace"] = self._opts.replace
 
         t0 = time.perf_counter()
         try:
