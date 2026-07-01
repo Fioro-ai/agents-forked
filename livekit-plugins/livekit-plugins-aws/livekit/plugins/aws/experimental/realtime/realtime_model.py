@@ -69,11 +69,22 @@ MAX_MESSAGE_SIZE = 1024
 MAX_MESSAGES = 40
 DEFAULT_MAX_SESSION_RESTART_ATTEMPTS = 3
 DEFAULT_MAX_SESSION_RESTART_DELAY = 10
+RECOVERABLE_VALIDATION_ERROR_MESSAGES = (
+    "InternalErrorCode=531::RST_STREAM closed stream. HTTP/2 error code: NO_ERROR",
+    "System instability detected. Please retry your request.",
+)
 # Session recycling: restart before 8-min AWS limit or credential expiry
 # Override with LK_SESSION_MAX_DURATION env var for testing (e.g., "60" for 1 minute)
 MAX_SESSION_DURATION_SECONDS = int(os.getenv("LK_SESSION_MAX_DURATION", 6 * 60))
 CREDENTIAL_EXPIRY_BUFFER_SECONDS = 3 * 60  # Restart 3 min before credential expiry
 BARGE_IN_SIGNAL = '{ "interrupted" : true }'  # Nova Sonic's barge-in detection signal
+
+
+def _is_recoverable_validation_error(exc: object) -> bool:
+    message = getattr(exc, "message", str(exc))
+    return any(text in message for text in RECOVERABLE_VALIDATION_ERROR_MESSAGES)
+
+
 DEFAULT_SYSTEM_PROMPT = (
     "Your name is Sonic, and you are a friendly and enthusiastic voice assistant. "
     "You love helping people and having natural conversations. "
@@ -1528,11 +1539,10 @@ class RealtimeSession(  # noqa: F811
                     self._close_current_generation()
                     raise
                 except ValidationException as ve:
-                    # there is a 3min no-activity (e.g. silence) timeout on the stream, after which the stream is closed  # noqa: E501
-                    if (
-                        "InternalErrorCode=531::RST_STREAM closed stream. HTTP/2 error code: NO_ERROR"  # noqa: E501
-                        in ve.message
-                    ):
+                    # Some Bedrock ValidationException messages represent transient stream
+                    # failures. Recover by restarting the Sonic session instead of tearing
+                    # down the LiveKit session.
+                    if _is_recoverable_validation_error(ve):
                         logger.warning(f"Validation error: {ve}\nAttempting to recover...")
                         await self._restart_session(ve)
                     elif "Tool Response parsing error" in ve.message:
@@ -2116,7 +2126,7 @@ class RealtimeSession(  # noqa: F811
                     if self._pending_generation_fut is fut:
                         self._pending_generation_fut = None
 
-            asyncio.create_task(_send_text())
+            send_task = asyncio.create_task(_send_text())
 
             # Set timeout from model configuration
             def _on_timeout() -> None:
@@ -2130,7 +2140,17 @@ class RealtimeSession(  # noqa: F811
             timeout_handle = asyncio.get_running_loop().call_later(
                 self._realtime_model._generate_reply_timeout, _on_timeout
             )
-            fut.add_done_callback(lambda _: timeout_handle.cancel())
+
+            def _on_fut_done(f: asyncio.Future[llm.GenerationCreatedEvent]) -> None:
+                timeout_handle.cancel()
+                is_current = self._pending_generation_fut is fut
+                if is_current:
+                    self._pending_generation_fut = None
+                if f.cancelled() and is_current and not send_task.done():
+                    # external cancel before the text was sent: drop the send
+                    send_task.cancel()
+
+            fut.add_done_callback(_on_fut_done)
 
             return fut
 

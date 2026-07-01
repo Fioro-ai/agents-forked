@@ -461,11 +461,6 @@ class AudioStreamDecoder:
                 for f in resampler.resample(None):
                     self._emit_av_frame(f)
 
-        except av.error.EOFError:
-            # Input ended before FFmpeg could parse enough data — typically caused
-            # by early cancellation, a very short utterance, or a premature upstream
-            # close. The container has nothing to emit; this is not an error.
-            logger.debug("audio decoder input ended before any audio could be decoded")
         except Exception:
             logger.exception("error decoding audio")
         finally:
@@ -503,8 +498,9 @@ class AudioStreamDecoder:
         if not self._started:
             return
 
-        async for _ in self._output_ch:
-            pass
-
-        if self._executor is not None:
-            self._executor.shutdown(wait=False, cancel_futures=True)
+        try:
+            async for _ in self._output_ch:
+                pass
+        finally:
+            if self._executor is not None:
+                self._executor.shutdown(wait=False, cancel_futures=True)
