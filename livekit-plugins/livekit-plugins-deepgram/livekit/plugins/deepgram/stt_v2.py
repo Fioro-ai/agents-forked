@@ -282,11 +282,8 @@ class STTv2(stt.STT):
         merged = list(dict.fromkeys([*self._user_keyterm, *keyterms]))
         self._opts.keyterm = merged
         for stream in self._streams:
-            if stream._speaking:
-                # defer the reconnect to the end of the utterance so we don't cut it off
-                stream._pending_keyterm = merged
-            else:
-                stream.update_options(keyterm=merged)
+            # tuned in-band, safe to apply mid-utterance
+            stream.update_options(keyterm=merged)
 
 
 class SpeechStreamv2(stt.SpeechStream):
@@ -317,8 +314,9 @@ class SpeechStreamv2(stt.SpeechStream):
 
         self._request_id = ""
         self._reconnect_event = asyncio.Event()
-        # keyterms set while the user is speaking; applied at END_OF_SPEECH (latest wins)
-        self._pending_keyterm: list[str] | None = None
+        # active connection for in-band Configure updates; None while disconnected
+        self._ws: aiohttp.ClientWebSocketResponse | None = None
+        self._reconfigure_atask: asyncio.Task[None] | None = None
 
     def update_options(
         self,
@@ -351,7 +349,6 @@ class SpeechStreamv2(stt.SpeechStream):
             keyterm = keyterms
         if is_given(keyterm):
             self._opts.keyterm = keyterm
-            self._pending_keyterm = None
         if is_given(mip_opt_out):
             self._opts.mip_opt_out = mip_opt_out
         if is_given(tags):
@@ -363,12 +360,55 @@ class SpeechStreamv2(stt.SpeechStream):
         if is_given(eager_eot_threshold):
             self._opts.eager_eot_threshold = eager_eot_threshold
 
-        self._reconnect_event.set()
+        # these only take effect on a fresh connection
+        needs_reconnect = any(
+            is_given(opt) for opt in (model, sample_rate, mip_opt_out, tags, endpoint_url)
+        )
+        if needs_reconnect:
+            # reconnect carries the latest options
+            self._reconnect_event.set()
+            return
 
-    def _on_end_of_speech(self) -> None:
-        if self._pending_keyterm is not None:
-            self.update_options(keyterm=self._pending_keyterm)
-            self._pending_keyterm = None
+        # send only changed fields; Flux keeps omitted ones unchanged
+        # https://developers.deepgram.com/docs/flux/configure
+        thresholds: dict[str, Any] = {}
+        if is_given(eager_eot_threshold):
+            thresholds["eager_eot_threshold"] = eager_eot_threshold
+        if is_given(eot_threshold):
+            thresholds["eot_threshold"] = eot_threshold
+        if is_given(eot_timeout_ms):
+            thresholds["eot_timeout_ms"] = eot_timeout_ms
+
+        changed_options: dict[str, Any] = {}
+        if thresholds:
+            changed_options["thresholds"] = thresholds
+        if is_given(keyterm):
+            # keyterms replaces the whole list, so send the full effective set
+            changed_options["keyterms"] = self._opts.keyterm
+        if is_given(language_hint):
+            changed_options["language_hints"] = self._opts.language_hint
+
+        if changed_options:
+            # chain off the previous send so deltas reach the server in order
+            self._reconfigure_atask = asyncio.create_task(
+                self._send_configure(changed_options, self._reconfigure_atask)
+            )
+
+    async def _send_configure(
+        self, options: dict[str, Any], prev: asyncio.Task[None] | None
+    ) -> None:
+        if prev is not None:
+            await asyncio.gather(prev, return_exceptions=True)
+
+        ws = self._ws
+        if ws is None or ws.closed:
+            # not connected; next connection carries the latest options
+            return
+        try:
+            await ws.send_str(json.dumps({"type": "Configure", **options}))
+        except Exception:
+            # closing; next connection carries the latest options
+            logger.debug("failed to send Configure to deepgram")
 
     async def _run(self) -> None:
         closing_ws = False
@@ -397,25 +437,34 @@ class SpeechStreamv2(stt.SpeechStream):
             )
 
             has_ended = False
-            async for data in self._input_ch:
-                frames: list[rtc.AudioFrame] = []
-                if isinstance(data, rtc.AudioFrame):
-                    frames.extend(audio_bstream.write(data.data.tobytes()))
-                elif isinstance(data, self._FlushSentinel):
-                    frames.extend(audio_bstream.flush())
-                    has_ended = True
+            try:
+                async for data in self._input_ch:
+                    frames: list[rtc.AudioFrame] = []
+                    if isinstance(data, rtc.AudioFrame):
+                        frames.extend(audio_bstream.write(data.data.tobytes()))
+                    elif isinstance(data, self._FlushSentinel):
+                        frames.extend(audio_bstream.flush())
+                        has_ended = True
 
-                for frame in frames:
-                    self._audio_duration_collector.push(frame.duration)
-                    await ws.send_bytes(frame.data.tobytes())
+                    for frame in frames:
+                        self._audio_duration_collector.push(frame.duration)
+                        await ws.send_bytes(frame.data.tobytes())
 
                     if has_ended:
                         self._audio_duration_collector.flush()
                         has_ended = False
 
-            # tell deepgram we are done sending audio/inputs
-            closing_ws = True
-            await ws.send_str(SpeechStreamv2._CLOSE_MSG)
+                # tell deepgram we are done sending audio/inputs
+                closing_ws = True
+                await ws.send_str(SpeechStreamv2._CLOSE_MSG)
+            except (aiohttp.ClientError, ConnectionError) as e:
+                # a mid-write socket drop surfaces here as a raw connection error.
+                # if the close is expected (aclose or the http session closing) just
+                # return; otherwise re-raise as a retryable APIError so _main_task
+                # reconnects, symmetric with recv_task.
+                if closing_ws or self._session.closed:
+                    return
+                raise APIConnectionError("deepgram connection closed unexpectedly") from e
 
         @utils.log_exceptions(logger=logger)
         async def recv_task(ws: aiohttp.ClientWebSocketResponse) -> None:
@@ -453,6 +502,8 @@ class SpeechStreamv2(stt.SpeechStream):
         while True:
             try:
                 ws = await self._connect_ws()
+                # expose the connection for in-band Configure updates
+                self._ws = ws
                 tasks = [
                     asyncio.create_task(send_task(ws)),
                     asyncio.create_task(recv_task(ws)),
@@ -480,6 +531,10 @@ class SpeechStreamv2(stt.SpeechStream):
                     tasks_group.cancel()
                     tasks_group.exception()  # retrieve the exception
             finally:
+                self._ws = None
+                if self._reconfigure_atask is not None:
+                    await utils.aio.gracefully_cancel(self._reconfigure_atask)
+                    self._reconfigure_atask = None
                 if ws is not None:
                     await ws.close()
 
@@ -596,7 +651,12 @@ class SpeechStreamv2(stt.SpeechStream):
 
                 end_event = stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH)
                 self._event_ch.send_nowait(end_event)
-                self._on_end_of_speech()
+
+        elif data["type"] == "ConfigureSuccess":
+            logger.debug("deepgram applied Configure update", extra={"data": data})
+
+        elif data["type"] == "ConfigureFailure":
+            logger.warning("deepgram rejected Configure update", extra={"data": data})
 
         elif data["type"] == "Error":
             logger.warning("deepgram sent an error", extra={"data": data})
