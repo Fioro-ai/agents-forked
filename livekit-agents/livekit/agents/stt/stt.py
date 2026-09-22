@@ -122,6 +122,10 @@ class SpeechEvent:
     speech_start_time: float | None = None
     """server-reported wall-clock time of speech onset, when the provider sends
     a separate speech-start signal carrying onset timing."""
+    created_at: float = field(default_factory=lambda: time.time())
+    """Wall-clock time when this event was created."""
+    speech_end_time: float | None = None
+    """Wall-clock time when the recognized speech ended, when known."""
 
 
 @dataclass
@@ -471,6 +475,11 @@ class RecognizeStream(ABC):
                 last_start_time = time.time()
                 return await self._run()
             except APIError as e:
+                # an attempt that outlived the connect timeout had connected, so this failure
+                # is not consecutive with the previous one and the budget starts over
+                if time.time() - last_start_time > self._conn_options.timeout:
+                    self._num_retries = 0
+
                 if not e.retryable or max_retries == 0:
                     self._emit_error(e, recoverable=False)
                     raise

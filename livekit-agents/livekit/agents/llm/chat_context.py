@@ -380,7 +380,8 @@ class FunctionCallOutput(BaseModel):
     reply_required: bool = Field(default=True)
     """Whether the model should answer once it receives this output.
 
-    Only realtime models read it, since they answer a result on their own.
+    AgentSession uses it to decide whether to generate a follow-up reply.
+    Realtime models can also use it to schedule their response.
     """
 
 
@@ -522,6 +523,13 @@ class ChatContext:
                     continue
 
         valid_tools = set(get_tool_names(tools)) if tools else set()
+        # FunctionCallOutput.name is optional, so an output that has none is paired with its
+        # call by call_id instead
+        valid_call_ids = {
+            item.call_id
+            for item in self.items
+            if item.type == "function_call" and item.name in valid_tools
+        }
         for item in self.items:
             if exclude_function_call and item.type in [
                 "function_call",
@@ -545,12 +553,16 @@ class ChatContext:
             if exclude_config_update and item.type == "agent_config_update":
                 continue
 
-            if (
-                is_given(tools)
-                and (item.type == "function_call" or item.type == "function_call_output")
-                and item.name not in valid_tools
-            ):
-                continue
+            if is_given(tools):
+                if item.type == "function_call" and item.name not in valid_tools:
+                    continue
+
+                if item.type == "function_call_output" and (
+                    item.name not in valid_tools
+                    if item.name
+                    else item.call_id not in valid_call_ids
+                ):
+                    continue
 
             items.append(item)
 
@@ -711,7 +723,7 @@ class ChatContext:
 
     @overload
     def to_provider_format(
-        self, format: Literal["mistralai"]
+        self, format: Literal["mistralai"], *, inject_dummy_user_message: bool = True
     ) -> tuple[list[dict], _provider_format.mistralai.MistralFormatData]: ...
 
     @overload
@@ -746,7 +758,9 @@ class ChatContext:
         elif format == "anthropic":
             return _provider_format.anthropic.to_chat_ctx(self, **kwargs)
         elif format == "mistralai":
-            return _provider_format.mistralai.to_conversations_ctx(self)
+            return _provider_format.mistralai.to_conversations_ctx(
+                self, inject_dummy_user_message=inject_dummy_user_message
+            )
         else:
             raise ValueError(f"Unsupported provider format: {format}")
 

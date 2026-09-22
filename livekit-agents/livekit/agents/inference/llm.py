@@ -27,12 +27,15 @@ from ..llm.tool_context import Tool
 from ..log import logger
 from ..types import DEFAULT_API_CONNECT_OPTIONS, NOT_GIVEN, APIConnectOptions, NotGivenOr
 from ..utils import is_given
+from ._realtime_models import is_realtime_model
 from ._utils import (
     HEADER_INFERENCE_PROVIDER,
+    InferenceClass,
     create_access_token,
     extract_quota_usage,
     get_default_inference_url,
     get_inference_headers,
+    resolve_credentials,
 )
 
 lk_oai_debug = int(os.getenv("LK_OPENAI_DEBUG", 0))
@@ -174,10 +177,6 @@ XAIModels = Literal[
 
 LLMModels = OpenAIModels | GoogleModels | KimiModels | DeepSeekModels | ZAIModels | XAIModels
 
-InferenceClass = Literal["priority", "standard", "low"]
-"""Scheduling class for a request. ``low`` yields to voice traffic, so it is only
-appropriate for work no caller is waiting on."""
-
 
 class ChatCompletionOptions(TypedDict, total=False):
     frequency_penalty: float | None
@@ -239,25 +238,7 @@ class LLM(llm.LLM):
 
         lk_base_url = base_url if base_url else get_default_inference_url()
 
-        lk_api_key = (
-            api_key
-            if api_key
-            else os.getenv("LIVEKIT_INFERENCE_API_KEY", os.getenv("LIVEKIT_API_KEY", ""))
-        )
-        if not lk_api_key:
-            raise ValueError(
-                "api_key is required, either as argument or set LIVEKIT_API_KEY environmental variable"
-            )
-
-        lk_api_secret = (
-            api_secret
-            if api_secret
-            else os.getenv("LIVEKIT_INFERENCE_API_SECRET", os.getenv("LIVEKIT_API_SECRET", ""))
-        )
-        if not lk_api_secret:
-            raise ValueError(
-                "api_secret is required, either as argument or set LIVEKIT_API_SECRET environmental variable"
-            )
+        lk_api_key, lk_api_secret = resolve_credentials(api_key, api_secret)
 
         self._opts = _LLMOptions(
             model=model,
@@ -474,12 +455,17 @@ class LLMStream(llm.LLMStream):
                     if chunk.usage is not None:
                         tokens_details = chunk.usage.prompt_tokens_details
                         cached_tokens = tokens_details.cached_tokens if tokens_details else 0
+                        completion_details = chunk.usage.completion_tokens_details
+                        reasoning_tokens = (
+                            completion_details.reasoning_tokens if completion_details else 0
+                        )
                         usage_chunk = llm.ChatChunk(
                             id=chunk.id,
                             usage=llm.CompletionUsage(
                                 completion_tokens=chunk.usage.completion_tokens or 0,
                                 prompt_tokens=chunk.usage.prompt_tokens or 0,
                                 prompt_cached_tokens=cached_tokens or 0,
+                                reasoning_tokens=reasoning_tokens or 0,
                                 total_tokens=chunk.usage.total_tokens or 0,
                                 service_tier=getattr(chunk, "service_tier", None),
                             ),
@@ -603,3 +589,19 @@ class LLMStream(llm.LLMStream):
                 extra=delta_extra,
             ),
         )
+
+
+def llm_from_model_string(model: str) -> llm.LLM | llm.RealtimeModel:
+    """Create the inference model a ``llm=`` string names.
+
+    Realtime (speech-to-speech) model strings resolve to
+    :class:`livekit.agents.inference.RealtimeModel`, every other string to
+    :class:`livekit.agents.inference.LLM`.
+    """
+    if is_realtime_model(model):
+        # imported lazily: the realtime package imports this module
+        from .realtime import RealtimeModel
+
+        return RealtimeModel.from_model_string(model)
+
+    return LLM.from_model_string(model)
