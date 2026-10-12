@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Literal
 from urllib.parse import urlparse
 
-import httpx
+import httpx2 as httpx
 
 import openai
 from livekit.agents import llm
@@ -124,7 +124,16 @@ class LLM(llm.LLM):
         super().__init__()
 
         if not is_given(reasoning_effort) and _supports_reasoning_effort(model):
-            if model in ["gpt-5.1", "gpt-5.2", "gpt-5.4", "gpt-5.4-mini"]:
+            if model in [
+                "gpt-5.1",
+                "gpt-5.2",
+                "gpt-5.4",
+                "gpt-5.4-mini",
+                "gpt-5.5",
+                "gpt-5.6-luna",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+            ]:
                 reasoning_effort = "none"
             else:
                 reasoning_effort = "minimal"
