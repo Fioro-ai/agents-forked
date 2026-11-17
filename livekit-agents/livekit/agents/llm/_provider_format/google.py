@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import itertools
 import json
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ def to_chat_ctx(
     inject_dummy_user_message: bool = True,
     thought_signatures: dict[str, bytes] | None = None,
     merge_dynamic_instructions: bool = True,
+    text_signature_model: str | None = None,
 ) -> tuple[list[dict], GoogleFormatData]:
     chat_ctx = convert_mid_conversation_instructions(
         chat_ctx, merge_dynamic_instructions=merge_dynamic_instructions
@@ -57,6 +59,7 @@ def to_chat_ctx(
             current_role = role
 
         if msg.type == "message":
+            parts_before = len(parts)
             for content in msg.content:
                 if isinstance(content, llm.ImageContent):
                     parts.append(_to_image_part(content))
@@ -67,6 +70,19 @@ def to_chat_ctx(
                 elif content:
                     # str or Instructions
                     parts.append({"text": str(content)})
+            # Send a text answer's thought signature back to the model that produced it. A cut
+            # answer (interrupted, failed TTS) no longer matches its signature.
+            stored = msg.extra.get("google") or {}
+            if (
+                text_signature_model
+                and msg.role == "assistant"
+                and not msg.interrupted
+                and len(parts) > parts_before
+                and "text" in parts[-1]
+                and stored.get("model") == text_signature_model
+                and (signature := stored.get("thought_signature"))
+            ):
+                parts[-1]["thought_signature"] = base64.b64decode(signature)
         elif msg.type == "function_call":
             fc_part: dict[str, Any] = {
                 "function_call": {

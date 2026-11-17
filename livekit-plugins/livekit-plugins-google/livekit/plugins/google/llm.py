@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 from collections.abc import Iterable
@@ -172,6 +173,7 @@ class _LLMOptions:
     service_tier: NotGivenOr[types.ServiceTier]
     cached_content: NotGivenOr[str]
     media_resolution: NotGivenOr[types.MediaResolution]
+    text_thought_signatures: bool
 
 
 # Gemini 4 spends output tokens on thinking, so a low ceiling can end a turn before it
@@ -225,6 +227,7 @@ class LLM(llm.LLM):
         cached_content: NotGivenOr[str] = NOT_GIVEN,
         media_resolution: NotGivenOr[types.MediaResolution] = NOT_GIVEN,
         credentials: google.auth.credentials.Credentials | None = None,
+        text_thought_signatures: bool = False,
     ) -> None:
         """
         Create a new instance of Google GenAI LLM.
@@ -258,6 +261,7 @@ class LLM(llm.LLM):
             service_tier (types.ServiceTier, optional): The service tier for the request (e.g. types.ServiceTier.PRIORITY). Defaults to None.
             cached_content (str, optional): Resource name of an explicit context cache to attach to every request from this LLM instance, e.g. ``"cachedContents/abc123"`` for the Gemini API or ``"projects/<project>/locations/<location>/cachedContents/abc123"`` for VertexAI. The cache must already exist — create it via ``client.caches.create(...)`` and pass the returned ``name``. Gemini rejects ``generateContent`` requests that combine ``cached_content`` with ``system_instruction``, ``tools``, or ``tool_config``, so when this option is set the plugin bakes those fields out of every outgoing request; the cache resource itself must contain whichever of them the model needs (typically the system prompt and the tool schemas). Useful for long-lived static prefixes where implicit caching is unreliable. See https://ai.google.dev/gemini-api/docs/caching for details and minimum prefix-token requirements. Defaults to None.
             media_resolution (types.MediaResolution, optional): The media resolution for the request. Defaults to None.
+            text_thought_signatures (bool, optional): Keep the thought signature of text answers on the stored assistant message and send it back in later turns, so the model sees its earlier reasoning (Gemini only requires this for function calls). Defaults to False.
         """  # noqa: E501
         super().__init__()
         gcp_project = project if is_given(project) else os.environ.get("GOOGLE_CLOUD_PROJECT")
@@ -350,6 +354,7 @@ class LLM(llm.LLM):
             service_tier=service_tier,
             cached_content=cached_content,
             media_resolution=media_resolution,
+            text_thought_signatures=text_thought_signatures,
         )
         self._client = Client(
             api_key=gemini_api_key,
@@ -660,6 +665,9 @@ class LLMStream(llm.LLMStream):
                 format="google",
                 thought_signatures=thought_sigs,
                 merge_dynamic_instructions=not using_cache,
+                text_signature_model=(
+                    self._model if self._llm._opts.text_thought_signatures else None
+                ),
             )
             if _is_gemini_4_model(self._model):
                 _put_a_user_turn_before_an_opening_tool_call(turns_dict)
@@ -810,9 +818,13 @@ class LLMStream(llm.LLMStream):
                                 # Only count parts that actually produce output. Thought
                                 # summaries (dropped in _parse_part) must not mark the
                                 # response as generated, otherwise a thought-only turn would
-                                # be treated as successful and skip the retry below.
-                                response_generated = True
-                                retryable = False
+                                # be treated as successful and skip the retry below. The
+                                # same holds for a chunk that only carries a thought signature.
+                                if chat_chunk.delta and (
+                                    chat_chunk.delta.content or chat_chunk.delta.tool_calls
+                                ):
+                                    response_generated = True
+                                    retryable = False
                                 self._event_ch.send_nowait(chat_chunk)
                 except (APIStatusError, APIConnectionError):
                     raise
@@ -979,16 +991,25 @@ class LLMStream(llm.LLMStream):
             )
             return chat_chunk
 
-        if not part.text:
-            return None
+        # A text answer's signature travels on the stored assistant message (ChoiceDelta.extra);
+        # base64 keeps the chat context JSON-serializable.
+        extra: dict[str, Any] | None = None
+        if self._llm._opts.text_thought_signatures and part.thought_signature:
+            extra = {
+                "google": {
+                    "thought_signature": base64.b64encode(part.thought_signature).decode(),
+                    "model": self._model,
+                }
+            }
 
         # Drop thought summaries: when include_thoughts is enabled Gemini streams its
         # reasoning back as parts flagged part.thought=True. These must not reach
         # ChoiceDelta.content, otherwise TTS would speak the model's internal reasoning.
-        if part.thought:
+        text = None if part.thought else part.text
+        if not text and extra is None:
             return None
 
         return llm.ChatChunk(
             id=id,
-            delta=llm.ChoiceDelta(content=part.text, role="assistant"),
+            delta=llm.ChoiceDelta(content=text or None, role="assistant", extra=extra),
         )

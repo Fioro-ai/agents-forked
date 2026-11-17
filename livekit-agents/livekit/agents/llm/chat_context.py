@@ -843,6 +843,7 @@ class ChatContext:
         inject_dummy_user_message: bool = True,
         thought_signatures: dict[str, bytes] | None = None,
         merge_dynamic_instructions: bool = True,
+        text_signature_model: str | None = None,
     ) -> tuple[list[dict], _provider_format.google.GoogleFormatData]: ...
 
     @overload
