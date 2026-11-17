@@ -49,11 +49,14 @@ def _new_stream(
     include_timestamps: bool = False,
     include_language_detection=NOT_GIVEN,
     secondary_languages: list[str] | Any = NOT_GIVEN,
+    model_id: str = "scribe_v2_realtime",
+    commit_strategy=NOT_GIVEN,
+    multilang_mode: bool = False,
 ) -> elevenlabs_stt.SpeechStream:
     # mirrors what STT.__init__ stores: both language options are normalized on the way in
     stream = object.__new__(elevenlabs_stt.SpeechStream)
     stream._opts = elevenlabs_stt.STTOptions(
-        model_id="scribe_v2_realtime",
+        model_id=model_id,
         api_key="test-key",
         base_url=elevenlabs_stt.API_BASE_URL_V1,
         language_code=None,
@@ -69,6 +72,8 @@ def _new_stream(
         no_verbatim=False,
         enable_logging=True,
         previous_text=None,
+        commit_strategy=commit_strategy,
+        multilang_mode=multilang_mode,
     )
     stream._language = LanguageCode(language) if language else None
     stream._event_ch = _EventSink()
@@ -970,3 +975,181 @@ async def test_recognize_language_override_applies_to_one_call() -> None:
     assert overridden.alternatives[0].language == "fr"
     assert default.alternatives[0].language == "en"
     assert batch_stt._opts.language_code == "en"
+
+
+# --- Scribe v3 Live: realtime path, turn prediction, multilingual mode
+
+
+def _stream_of(instance: elevenlabs_stt.STT) -> elevenlabs_stt.SpeechStream:
+    """A stream holding the options a real STT instance resolved, without opening a socket."""
+    stream = object.__new__(elevenlabs_stt.SpeechStream)
+    stream._opts = instance._opts
+    stream._language = instance._opts.language_code
+    return stream
+
+
+async def _realtime_query(**kwargs: Any) -> Any:
+    """The query of the realtime connect URL an STT built with these options asks for."""
+    kwargs.setdefault("model", "scribe_v2_realtime")
+    instance = elevenlabs_stt.STT(api_key="test-key", **kwargs)
+    return URL(await _connect_ws_url(_stream_of(instance))).query
+
+
+@pytest.mark.parametrize("model", ["scribe_v2_realtime", "scribe_v3_live"])
+async def test_realtime_models_stream_over_the_same_websocket(model: str) -> None:
+    assert elevenlabs_stt.STT(api_key="test-key", model=model).capabilities.streaming is True
+
+    instance = elevenlabs_stt.STT(
+        api_key="test-key",
+        model=model,
+        language_code="en",
+        secondary_languages=["es"],
+        include_language_detection=True,
+        server_vad={"vad_silence_threshold_secs": 0.5},
+    )
+    url = URL(await _connect_ws_url(_stream_of(instance)))
+
+    assert url.path.endswith("/speech-to-text/realtime")
+    assert url.query["model_id"] == model
+    assert url.query["commit_strategy"] == "vad"
+    assert url.query["vad_silence_threshold_secs"] == "0.5"
+    assert url.query.getall("secondary_languages") == ["es"]
+    assert url.query["include_language_detection"] == "true"
+    assert "multilang_mode" not in url.query
+
+
+def test_scribe_v3_stays_on_the_batch_api() -> None:
+    instance = elevenlabs_stt.STT(api_key="test-key", model="scribe_v3")
+
+    assert instance.capabilities.streaming is False
+    assert instance.capabilities.manual_flush is False
+
+
+def test_secondary_language_updates_reach_scribe_v3_live(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    instance = elevenlabs_stt.STT(api_key="test-key", model="scribe_v3_live", language_code="en")
+
+    with caplog.at_level("WARNING"):
+        instance.update_options(secondary_languages=["es"])
+
+    assert instance._opts.secondary_languages == ["es"]
+    assert "will be ignored" not in caplog.text
+
+
+async def test_turn_prediction_is_requested_for_scribe_v3_live() -> None:
+    query = await _realtime_query(
+        model="scribe_v3_live",
+        commit_strategy="turn_prediction",
+        server_vad={"vad_silence_threshold_secs": 1.2},
+    )
+
+    assert query["commit_strategy"] == "turn_prediction"
+    # VAD stays active under turn prediction, so its options still go out
+    assert query["vad_silence_threshold_secs"] == "1.2"
+
+
+async def test_turn_prediction_needs_no_server_vad_options() -> None:
+    query = await _realtime_query(model="scribe_v3_live", commit_strategy="turn_prediction")
+
+    assert query["commit_strategy"] == "turn_prediction"
+    assert "vad_silence_threshold_secs" not in query
+
+
+def test_each_commit_ends_the_turn_under_turn_prediction() -> None:
+    stream = _new_stream(model_id="scribe_v3_live", commit_strategy="turn_prediction")
+
+    stream._process_stream_event(_partial_transcript("hello"))
+    stream._process_stream_event(_committed_transcript("hello there"))
+
+    assert [event.type for event in stream._event_ch.events] == [
+        stt.SpeechEventType.START_OF_SPEECH,
+        stt.SpeechEventType.INTERIM_TRANSCRIPT,
+        stt.SpeechEventType.FINAL_TRANSCRIPT,
+        stt.SpeechEventType.END_OF_SPEECH,
+    ]
+    assert stream._speaking is False
+
+
+async def test_an_explicit_commit_strategy_overrides_the_server_vad_default() -> None:
+    assert (await _realtime_query(commit_strategy="vad"))["commit_strategy"] == "vad"
+    assert (await _realtime_query(commit_strategy="manual", server_vad={}))[
+        "commit_strategy"
+    ] == "manual"
+
+
+async def test_turn_prediction_is_ignored_for_other_realtime_models(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING"):
+        query = await _realtime_query(commit_strategy="turn_prediction")
+
+    assert "`turn_prediction` commit strategy is only supported for Scribe v3 Live" in caplog.text
+    assert query["commit_strategy"] == "manual"
+
+
+def test_the_commit_strategy_is_ignored_for_batch_models(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING"):
+        instance = elevenlabs_stt.STT(
+            api_key="test-key", model="scribe_v3", commit_strategy="turn_prediction"
+        )
+
+    assert instance._opts.commit_strategy is NOT_GIVEN
+    assert "`commit_strategy` is only supported for realtime models" in caplog.text
+
+
+def test_an_unknown_commit_strategy_is_rejected() -> None:
+    with pytest.raises(ValueError, match="commit_strategy must be one of"):
+        elevenlabs_stt.STT(
+            api_key="test-key", model="scribe_v3_live", commit_strategy=cast(Any, "turns")
+        )
+
+
+async def test_multilingual_mode_is_requested_for_scribe_v3_live() -> None:
+    query = await _realtime_query(model="scribe_v3_live", multilang_mode=True)
+
+    assert query["multilang_mode"] == "true"
+
+
+async def test_multilingual_mode_is_ignored_for_other_models(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING"):
+        query = await _realtime_query(multilang_mode=True)
+
+    assert "`multilang_mode` is only supported for Scribe v3 Live" in caplog.text
+    assert "multilang_mode" not in query
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "manual_flush"),
+    [
+        ({}, True),
+        ({"server_vad": {}}, False),
+        ({"commit_strategy": "turn_prediction"}, False),
+        ({"commit_strategy": "turn_prediction", "server_vad": {}}, False),
+        ({"commit_strategy": "vad"}, False),
+        ({"commit_strategy": "manual", "server_vad": {}}, True),
+    ],
+)
+def test_manual_flush_follows_the_commit_strategy(kwargs: dict, manual_flush: bool) -> None:
+    # a server that commits on its own must not also get the framework's commits
+    instance = elevenlabs_stt.STT(api_key="test-key", model="scribe_v3_live", **kwargs)
+
+    assert instance.capabilities.manual_flush is manual_flush
+
+
+def test_server_vad_updates_keep_an_explicit_commit_strategy() -> None:
+    instance = elevenlabs_stt.STT(
+        api_key="test-key", model="scribe_v3_live", commit_strategy="turn_prediction"
+    )
+
+    instance.update_options(server_vad={"vad_silence_threshold_secs": 0.8})
+    assert instance.capabilities.manual_flush is False
+    assert _stream_of(instance)._commit_strategy == "turn_prediction"
+
+    instance.update_options(server_vad=None)
+    assert instance.capabilities.manual_flush is False
+    assert _stream_of(instance)._commit_strategy == "turn_prediction"

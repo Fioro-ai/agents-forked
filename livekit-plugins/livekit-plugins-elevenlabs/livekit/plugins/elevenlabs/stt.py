@@ -93,6 +93,27 @@ ElevenLabsSTTModels = Literal[
 # Models served over the realtime WebSocket endpoint instead of the batch API.
 _REALTIME_MODELS = ("scribe_v2_realtime", "scribe_v3_live")
 
+# Models that predict the end of the speaker's turn and take the multilingual mode. The API
+# closes the session with `invalid_request` when another model is asked for either.
+_TURN_PREDICTION_MODELS = ("scribe_v3_live",)
+
+STTCommitStrategy = Literal["manual", "vad", "turn_prediction"]
+"""How a realtime session commits transcript segments: `manual` on a flush, `vad` after a
+silence, or `turn_prediction` when the model predicts the end of the user's turn."""
+
+_COMMIT_STRATEGIES: tuple[STTCommitStrategy, ...] = ("manual", "vad", "turn_prediction")
+
+
+def _resolve_commit_strategy(
+    commit_strategy: NotGivenOr[STTCommitStrategy],
+    server_vad: NotGivenOr[VADOptions | None],
+) -> STTCommitStrategy:
+    """An explicit strategy wins; without one, server VAD options decide as they always did."""
+    if is_given(commit_strategy):
+        return commit_strategy
+
+    return "vad" if is_given(server_vad) and server_vad is not None else "manual"
+
 
 @dataclass
 class STTOptions:
@@ -111,6 +132,8 @@ class STTOptions:
     enable_logging: bool
     previous_text: str | None
     audio_chunk_duration_ms: int = 50
+    commit_strategy: NotGivenOr[STTCommitStrategy] = NOT_GIVEN
+    multilang_mode: bool = False
 
 
 class STT(stt.STT):
@@ -135,6 +158,8 @@ class STT(stt.STT):
         no_verbatim: NotGivenOr[bool] = NOT_GIVEN,
         enable_logging: bool = True,
         previous_text: NotGivenOr[str] = NOT_GIVEN,
+        commit_strategy: NotGivenOr[STTCommitStrategy] = NOT_GIVEN,
+        multilang_mode: bool = False,
     ) -> None:
         """
         Create a new instance of ElevenLabs STT.
@@ -180,6 +205,15 @@ class STT(stt.STT):
                 mode will be used. Defaults to True.
             previous_text (NotGivenOr[str]): Preceding text context sent once on the first realtime
                 audio chunk to improve transcription accuracy. Only supported for realtime models.
+            commit_strategy (NotGivenOr[STTCommitStrategy]): How the realtime session commits
+                transcript segments. Defaults to "vad" when `server_vad` is set and "manual"
+                otherwise. "turn_prediction" commits when the model predicts the end of the
+                user's turn and still commits after the `server_vad` silence threshold, so the
+                `server_vad` options keep applying. Only supported for realtime models;
+                "turn_prediction" only for Scribe v3 Live.
+            multilang_mode (bool): Transcribe every language spoken in its own script, following
+                speakers who switch languages mid-sentence. Only supported for Scribe v3 Live.
+                Default is False.
         """
 
         if (
@@ -236,12 +270,38 @@ class STT(stt.STT):
             )
             resolved_previous_text = None
 
+        if is_given(commit_strategy) and commit_strategy not in _COMMIT_STRATEGIES:
+            raise ValueError(
+                f"commit_strategy must be one of {', '.join(_COMMIT_STRATEGIES)}, "
+                f"got {commit_strategy!r}"
+            )
+
+        if not use_realtime and is_given(commit_strategy):
+            logger.warning(
+                "`commit_strategy` is only supported for realtime models and will be ignored"
+            )
+            commit_strategy = NOT_GIVEN
+        elif commit_strategy == "turn_prediction" and model not in _TURN_PREDICTION_MODELS:
+            logger.warning(
+                "`turn_prediction` commit strategy is only supported for Scribe v3 Live "
+                "and will be ignored"
+            )
+            commit_strategy = NOT_GIVEN
+
+        if multilang_mode and model not in _TURN_PREDICTION_MODELS:
+            logger.warning(
+                "`multilang_mode` is only supported for Scribe v3 Live and will be ignored"
+            )
+            multilang_mode = False
+
         super().__init__(
             capabilities=STTCapabilities(
                 streaming=use_realtime,
                 interim_results=True,
                 aligned_transcript="word" if include_timestamps and use_realtime else False,
-                manual_flush=use_realtime and (not is_given(server_vad) or server_vad is None),
+                # the framework only commits a turn itself while the server does not
+                manual_flush=use_realtime
+                and _resolve_commit_strategy(commit_strategy, server_vad) == "manual",
             )
         )
 
@@ -270,6 +330,8 @@ class STT(stt.STT):
             no_verbatim=no_verbatim if is_given(no_verbatim) else False,
             enable_logging=enable_logging,
             previous_text=resolved_previous_text,
+            commit_strategy=commit_strategy,
+            multilang_mode=multilang_mode,
         )
         self._session = http_session
         self._streams = weakref.WeakSet[SpeechStream]()
@@ -417,13 +479,18 @@ class STT(stt.STT):
         Pass {} to enable server VAD with defaults, or a VADOptions dict to configure it.
         Changing server_vad reconnects active streams and can discard unfinished transcripts.
         Wait for the current turn's final transcript before changing the commit strategy.
+        A `commit_strategy` set at construction is kept: server_vad then only changes the VAD
+        options the session is opened with.
         """
         if is_given(tag_audio_events):
             self._opts.tag_audio_events = tag_audio_events
 
         if is_given(server_vad):
             self._opts.server_vad = server_vad
-            self._capabilities.manual_flush = self._capabilities.streaming and server_vad is None
+            self._capabilities.manual_flush = (
+                self._capabilities.streaming
+                and _resolve_commit_strategy(self._opts.commit_strategy, server_vad) == "manual"
+            )
 
         if is_given(keyterms):
             self._opts.keyterms = keyterms
@@ -534,6 +601,10 @@ class SpeechStream(stt.SpeechStream):
     @property
     def _server_vad(self) -> VADOptions | None:
         return self._opts.server_vad if is_given(self._opts.server_vad) else None
+
+    @property
+    def _commit_strategy(self) -> STTCommitStrategy:
+        return _resolve_commit_strategy(self._opts.commit_strategy, self._opts.server_vad)
 
     @property
     def _language_detection(self) -> bool:
@@ -739,16 +810,18 @@ class SpeechStream(stt.SpeechStream):
 
     async def _connect_ws(self) -> aiohttp.ClientWebSocketResponse:
         """Establish WebSocket connection to the ElevenLabs Scribe realtime API"""
-        commit_strategy = "vad" if self._server_vad is not None else "manual"
         params = [
             f"model_id={self._opts.model_id}",
             f"audio_format=pcm_{self._opts.sample_rate}",
-            f"commit_strategy={commit_strategy}",
+            f"commit_strategy={self._commit_strategy}",
             f"enable_logging={str(self._opts.enable_logging).lower()}",
         ]
 
         if self._language_detection:
             params.append("include_language_detection=true")
+
+        if self._opts.multilang_mode:
+            params.append("multilang_mode=true")
 
         if (server_vad := self._server_vad) is not None:
             if (
@@ -881,7 +954,9 @@ class SpeechStream(stt.SpeechStream):
                 )
                 self._event_ch.send_nowait(final_event)
 
-            if self._speaking and (not text or self._server_vad is not None):
+            # the server commits on its own unless commits are manual, so each commit ends
+            # the turn; a manual one only does once it comes back empty
+            if self._speaking and (not text or self._commit_strategy != "manual"):
                 self._event_ch.send_nowait(
                     stt.SpeechEvent(
                         type=SpeechEventType.END_OF_SPEECH,
