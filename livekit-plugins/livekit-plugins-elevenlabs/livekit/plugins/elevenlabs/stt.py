@@ -20,6 +20,7 @@ import contextlib
 import json
 import math
 import os
+import time
 import weakref
 from dataclasses import dataclass
 from typing import Any, Literal, TypedDict
@@ -107,6 +108,22 @@ _COMMIT_STRATEGIES: tuple[STTCommitStrategy, ...] = ("manual", "vad", "turn_pred
 # How long a flush waits for the answer to a commit already on its way. Scribe answers within
 # about 0.2s; past this the flush commits anyway rather than hold the caller's final transcript.
 _COMMIT_ANSWER_TIMEOUT = 1.0
+
+# The turn probability at which the server commits under the `turn_prediction` strategy.
+_SERVER_TURN_PROBABILITY = 0.9
+
+# Scribe v3 Live commits on its own once about 35s of audio have accumulated since the connect
+# or the last commit (35.2-35.3s measured), in every commit strategy and without marking the
+# message. It is not the end of a turn: the speaker is usually mid-word.
+_FORCED_COMMIT_MIN_AUDIO = 34.0
+# A forced commit cuts running speech, so the partial text changed just before it; before a
+# silence commit it has stood still for the silence threshold.
+_FORCED_COMMIT_MAX_TEXT_AGE = 1.0
+# Nothing follows a forced commit when the speaker stopped right at it, so the turn is ended
+# here after the silence the server would have waited for, and never sooner than this.
+_FORCED_COMMIT_MIN_WAIT = 1.0
+# The server's `vad_silence_threshold_secs` when none is set.
+_DEFAULT_VAD_SILENCE_SECS = 1.5
 
 
 def _resolve_commit_strategy(
@@ -601,9 +618,20 @@ class SpeechStream(stt.SpeechStream):
         self._min_commit_samples = opts.sample_rate * 3 // 10
         # audio sent on this connection since the last commit
         self._uncommitted_samples = 0
-        # a commit of ours the server has not answered yet (`turn_probability_threshold` only)
+        # a commit of ours the server has not answered yet
         self._commit_pending = False
         self._commit_answered = asyncio.Event()
+        # what the last partial said about the turn, and when its text last moved: together
+        # they tell a commit Scribe forced on running speech from one that ends a turn
+        self._last_turn_probability: float | None = None
+        self._partial_text_changed_at: float | None = None
+        # Scribe sends a commit twice when timestamps or the language are asked for; the
+        # second copy takes the verdict of the first
+        self._commit_copy_seen: str | None = None
+        self._commit_forced = False
+        # when to end a turn that a forced commit left open and no speech followed
+        self._forced_commit_deadline: float | None = None
+        self._forced_commit_armed = asyncio.Event()
         self._audio_duration_collector = PeriodicCollector(
             callback=self._on_audio_duration_report,
             duration=5.0,
@@ -742,7 +770,7 @@ class SpeechStream(stt.SpeechStream):
                         await send_audio(frame)
 
                     if has_ended:
-                        if self._commit_pending:
+                        if self._commit_pending and is_given(self._opts.turn_probability_threshold):
                             # Scribe counts the audio from where it finished our last commit,
                             # so one sent before its answer is throttled whatever is padded
                             with contextlib.suppress(asyncio.TimeoutError):
@@ -808,6 +836,17 @@ class SpeechStream(stt.SpeechStream):
                 except Exception:
                     logger.exception("failed to process ElevenLabs STT message")
 
+        async def forced_commit_task() -> None:
+            # ends a turn that a forced commit left open when no speech follows it
+            while True:
+                while (deadline := self._forced_commit_deadline) is not None:
+                    if (delay := deadline - time.monotonic()) > 0:
+                        await asyncio.sleep(delay)
+                    else:
+                        self._end_turn_after_forced_commit()
+                self._forced_commit_armed.clear()
+                await self._forced_commit_armed.wait()
+
         ws: aiohttp.ClientWebSocketResponse | None = None
 
         while True:
@@ -818,6 +857,9 @@ class SpeechStream(stt.SpeechStream):
                 self._final_alternatives = []
                 self._uncommitted_samples = 0
                 self._commit_pending = False
+                self._last_turn_probability = None
+                self._partial_text_changed_at = None
+                self._commit_copy_seen = None
                 if self._opts.previous_text:
                     # Must be the first input_audio_chunk on the connection.
                     await ws.send_str(
@@ -835,6 +877,7 @@ class SpeechStream(stt.SpeechStream):
                     asyncio.create_task(send_task(ws)),
                     asyncio.create_task(recv_task(ws)),
                     asyncio.create_task(keepalive_task(ws)),
+                    asyncio.create_task(forced_commit_task()),
                 ]
                 tasks_group = asyncio.gather(*tasks)
                 wait_reconnect_task = asyncio.create_task(self._reconnect_event.wait())
@@ -865,9 +908,8 @@ class SpeechStream(stt.SpeechStream):
         """Commit the audio sent so far. The count starts over before the send, so nothing
         that runs while it is on its way commits a second time."""
         self._uncommitted_samples = 0
-        if is_given(self._opts.turn_probability_threshold):
-            self._commit_pending = True
-            self._commit_answered.clear()
+        self._commit_pending = True
+        self._commit_answered.clear()
         await ws.send_str(
             json.dumps(
                 {
@@ -886,16 +928,7 @@ class SpeechStream(stt.SpeechStream):
 
         Partials keep arriving until the commit is answered, so only one goes out per segment,
         and never with less audio behind it than Scribe accepts."""
-        message_type = data.get("message_type")
-        if message_type in ("committed_transcript", "committed_transcript_with_timestamps"):
-            # a commit was finished, ours or the server's own after a silence: Scribe counts
-            # the uncommitted audio from here
-            self._uncommitted_samples = 0
-            self._commit_pending = False
-            self._commit_answered.set()
-            return
-
-        if message_type != "partial_transcript" or not data.get("text"):
+        if data.get("message_type") != "partial_transcript" or not data.get("text"):
             return
 
         threshold = self._opts.turn_probability_threshold
@@ -923,6 +956,66 @@ class SpeechStream(stt.SpeechStream):
         except (aiohttp.ClientError, ConnectionError):
             # the socket is going away; the receive loop reports it
             self._commit_pending = False
+
+    def _account_commit(self, message_type: str) -> bool:
+        """Take note of a committed transcript and tell whether Scribe forced the commit.
+
+        A forced commit answers none of ours, comes with about 35s of audio behind it, and
+        cuts speech that was neither predicted to end nor silent: the last partial was below
+        the turn threshold and its text had just changed."""
+        two_copies = self._final_message_type == "committed_transcript_with_timestamps"
+        if two_copies and self._commit_copy_seen not in (None, message_type):
+            # the other copy of the commit already taken note of
+            self._commit_copy_seen = None
+            return self._commit_forced
+
+        threshold = (
+            self._opts.turn_probability_threshold
+            if is_given(self._opts.turn_probability_threshold)
+            else _SERVER_TURN_PROBABILITY
+        )
+        probability = self._last_turn_probability
+        changed_at = self._partial_text_changed_at
+        uncommitted_audio = self._uncommitted_samples / self._opts.sample_rate
+        forced = (
+            not self._commit_pending
+            and uncommitted_audio >= _FORCED_COMMIT_MIN_AUDIO
+            and probability is not None
+            and probability < threshold
+            and changed_at is not None
+            and time.monotonic() - changed_at < _FORCED_COMMIT_MAX_TEXT_AGE
+        )
+        if forced:
+            logger.debug(
+                "Scribe forced a commit after %.1fs of audio, the turn stays open",
+                uncommitted_audio,
+                extra={"uncommitted_audio": uncommitted_audio, "turn_probability": probability},
+            )
+
+        self._commit_forced = forced
+        self._commit_copy_seen = message_type if two_copies else None
+        self._forced_commit_deadline = None
+        # a commit was finished, ours or the server's own: Scribe counts the uncommitted
+        # audio from here
+        self._uncommitted_samples = 0
+        self._commit_pending = False
+        self._commit_answered.set()
+        return forced
+
+    def _end_turn_after_forced_commit(self) -> None:
+        self._forced_commit_deadline = None
+        if not self._speaking:
+            return
+
+        logger.debug("no speech followed the forced commit, ending the turn")
+        self._event_ch.send_nowait(
+            stt.SpeechEvent(
+                type=SpeechEventType.END_OF_SPEECH,
+                alternatives=self._final_alternatives,
+            )
+        )
+        self._final_alternatives = []
+        self._speaking = False
 
     async def _connect_ws(self) -> aiohttp.ClientWebSocketResponse:
         """Establish WebSocket connection to the ElevenLabs Scribe realtime API"""
@@ -1027,11 +1120,25 @@ class SpeechStream(stt.SpeechStream):
                 for word in words
             ]
 
+        forced_commit = False
+        if message_type in ("committed_transcript", "committed_transcript_with_timestamps"):
+            forced_commit = self._account_commit(message_type)
+
         if message_type == "partial_transcript":
             logger.debug("Received message type partial_transcript", extra={"lk.pii.data": data})
 
+            probability = data.get("turn_probability")
+            self._last_turn_probability = (
+                probability
+                if isinstance(probability, (int, float)) and not isinstance(probability, bool)
+                else None
+            )
+
             if text and text != self._last_partial_text:
                 self._last_partial_text = text
+                self._partial_text_changed_at = time.monotonic()
+                # speech goes on after a forced commit, and the server ends this segment itself
+                self._forced_commit_deadline = None
 
                 # Send START_OF_SPEECH if we're not already speaking
                 if not self._speaking:
@@ -1071,8 +1178,11 @@ class SpeechStream(stt.SpeechStream):
                 self._event_ch.send_nowait(final_event)
 
             # the server commits on its own unless commits are manual, so each commit ends
-            # the turn; a manual one only does once it comes back empty
-            if self._speaking and (not text or self._commit_strategy != "manual"):
+            # the turn; a manual one only does once it comes back empty. A commit Scribe forced
+            # on running speech ends nothing: the turn goes on in the next segment.
+            if self._speaking and (
+                not text or (self._commit_strategy != "manual" and not forced_commit)
+            ):
                 self._event_ch.send_nowait(
                     stt.SpeechEvent(
                         type=SpeechEventType.END_OF_SPEECH,
@@ -1081,6 +1191,14 @@ class SpeechStream(stt.SpeechStream):
                 )
                 self._final_alternatives = []
                 self._speaking = False
+            elif self._speaking and forced_commit and self._commit_strategy != "manual":
+                # Scribe sends nothing more if the speaker stopped right at the cut
+                silence = (self._server_vad or {}).get("vad_silence_threshold_secs")
+                self._forced_commit_deadline = time.monotonic() + max(
+                    silence if silence is not None else _DEFAULT_VAD_SILENCE_SECS,
+                    _FORCED_COMMIT_MIN_WAIT,
+                )
+                self._forced_commit_armed.set()
 
         elif message_type in ("committed_transcript", "committed_transcript_with_timestamps"):
             # the other copy of a commit the branch above already emitted

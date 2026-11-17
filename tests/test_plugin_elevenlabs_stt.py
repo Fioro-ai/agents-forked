@@ -52,6 +52,7 @@ def _new_stream(
     model_id: str = "scribe_v2_realtime",
     commit_strategy=NOT_GIVEN,
     multilang_mode: bool = False,
+    turn_probability_threshold=NOT_GIVEN,
 ) -> elevenlabs_stt.SpeechStream:
     # mirrors what STT.__init__ stores: both language options are normalized on the way in
     stream = object.__new__(elevenlabs_stt.SpeechStream)
@@ -74,12 +75,22 @@ def _new_stream(
         previous_text=None,
         commit_strategy=commit_strategy,
         multilang_mode=multilang_mode,
+        turn_probability_threshold=turn_probability_threshold,
     )
     stream._language = LanguageCode(language) if language else None
     stream._event_ch = _EventSink()
     stream._speaking = False
     stream._last_partial_text = ""
     stream._final_alternatives = []
+    stream._uncommitted_samples = 0
+    stream._commit_pending = False
+    stream._commit_answered = asyncio.Event()
+    stream._last_turn_probability = None
+    stream._partial_text_changed_at = None
+    stream._commit_copy_seen = None
+    stream._commit_forced = False
+    stream._forced_commit_deadline = None
+    stream._forced_commit_armed = asyncio.Event()
     stream._input_ch = SimpleNamespace(start_time_offset=0.0)
     return stream
 
@@ -1534,3 +1545,342 @@ async def test_a_reconnect_forgets_an_unanswered_commit() -> None:
         assert _commits(ws) == 2
     finally:
         await stream.aclose()
+
+
+# --- Scribe v3 Live: the commit it forces after about 35s of audio is not a turn end
+
+_TURN = stt.SpeechEventType
+_FORCED_AUDIO_SAMPLES = 35 * 16000
+
+
+def _mid_speech_stream(**kwargs: Any) -> elevenlabs_stt.SpeechStream:
+    """A turn-predicting stream 35s into a segment, the speaker mid-sentence."""
+    kwargs.setdefault("commit_strategy", "turn_prediction")
+    stream = _new_stream(model_id="scribe_v3_live", **kwargs)
+    stream._uncommitted_samples = _FORCED_AUDIO_SAMPLES
+    stream._process_stream_event(_turn_partial("bevor sie überhaupt", 0.02))
+    return stream
+
+
+def _event_types(stream: elevenlabs_stt.SpeechStream) -> list[stt.SpeechEventType]:
+    return [event.type for event in stream._event_ch.events]
+
+
+def test_a_forced_commit_keeps_the_turn_open() -> None:
+    stream = _mid_speech_stream()
+
+    stream._process_stream_event(_committed_transcript("bevor sie überhaupt"))
+
+    assert _event_types(stream) == [
+        _TURN.START_OF_SPEECH,
+        _TURN.INTERIM_TRANSCRIPT,
+        _TURN.FINAL_TRANSCRIPT,
+    ]
+    assert stream._speaking is True
+    # the next forced commit is another 35s away
+    assert stream._uncommitted_samples == 0
+
+
+def test_the_turn_ends_with_the_segment_after_a_forced_commit() -> None:
+    stream = _mid_speech_stream()
+    stream._process_stream_event(_committed_transcript("bevor sie überhaupt"))
+
+    stream._process_stream_event(_turn_partial("ein Haus kaufen können.", 0.95))
+    stream._process_stream_event(_committed_transcript("ein Haus kaufen können."))
+
+    assert _event_types(stream) == [
+        _TURN.START_OF_SPEECH,
+        _TURN.INTERIM_TRANSCRIPT,
+        _TURN.FINAL_TRANSCRIPT,
+        _TURN.INTERIM_TRANSCRIPT,
+        _TURN.FINAL_TRANSCRIPT,
+        _TURN.END_OF_SPEECH,
+    ]
+    finals = [e for e in stream._event_ch.events if e.type == _TURN.FINAL_TRANSCRIPT]
+    assert [e.alternatives[0].text for e in finals] == [
+        "bevor sie überhaupt",
+        "ein Haus kaufen können.",
+    ]
+    assert stream._speaking is False
+
+
+def _not_enough_audio(stream: elevenlabs_stt.SpeechStream) -> None:
+    stream._uncommitted_samples = 33 * 16000
+
+
+def _predicted_turn_end(stream: elevenlabs_stt.SpeechStream) -> None:
+    stream._process_stream_event(_turn_partial("bevor sie überhaupt", 0.9))
+
+
+def _no_turn_probability(stream: elevenlabs_stt.SpeechStream) -> None:
+    stream._process_stream_event(_turn_partial("bevor sie überhaupt", None))
+
+
+def _silence_before_the_commit(stream: elevenlabs_stt.SpeechStream) -> None:
+    assert stream._partial_text_changed_at is not None
+    stream._partial_text_changed_at -= 2.5
+
+
+def _answer_to_our_commit(stream: elevenlabs_stt.SpeechStream) -> None:
+    stream._commit_pending = True
+
+
+@pytest.mark.parametrize(
+    "not_forced",
+    [
+        _not_enough_audio,
+        _predicted_turn_end,
+        _no_turn_probability,
+        _silence_before_the_commit,
+        _answer_to_our_commit,
+    ],
+)
+def test_a_commit_that_is_not_forced_still_ends_the_turn(
+    not_forced: Callable[[elevenlabs_stt.SpeechStream], None],
+) -> None:
+    stream = _mid_speech_stream()
+    not_forced(stream)
+
+    stream._process_stream_event(_committed_transcript("bevor sie überhaupt"))
+
+    assert _event_types(stream)[-2:] == [_TURN.FINAL_TRANSCRIPT, _TURN.END_OF_SPEECH]
+    assert stream._speaking is False
+    assert stream._forced_commit_deadline is None
+
+
+@pytest.mark.parametrize(
+    ("threshold", "probability", "forced"),
+    [(0.95, 0.92, True), (0.95, 0.95, False), (0.85, 0.88, False), (0.85, 0.5, True)],
+)
+def test_the_caller_s_threshold_decides_what_a_turn_end_is(
+    threshold: float, probability: float, forced: bool
+) -> None:
+    stream = _mid_speech_stream(commit_strategy="vad", turn_probability_threshold=threshold)
+    stream._process_stream_event(_turn_partial("bevor sie überhaupt", probability))
+
+    stream._process_stream_event(_committed_transcript("bevor sie überhaupt"))
+
+    assert stream._speaking is forced
+
+
+@pytest.mark.parametrize("timestamps_first", [True, False])
+def test_both_copies_of_a_forced_commit_get_the_same_verdict(timestamps_first: bool) -> None:
+    # with the language detected the final copy is the one with timestamps; whichever copy
+    # comes first starts the count of audio over, so the other cannot be judged by it
+    stream = _mid_speech_stream(language=None)
+    copies = [
+        _committed_transcript("bevor sie überhaupt", with_timestamps=True, language_code="de"),
+        _committed_transcript("bevor sie überhaupt"),
+    ]
+
+    for copy in copies if timestamps_first else reversed(copies):
+        stream._process_stream_event(copy)
+
+    assert _event_types(stream) == [
+        _TURN.START_OF_SPEECH,
+        _TURN.INTERIM_TRANSCRIPT,
+        _TURN.FINAL_TRANSCRIPT,
+    ]
+    assert stream._speaking is True
+
+    # and the commit after it is judged afresh
+    stream._process_stream_event(_turn_partial("ein Haus kaufen können.", 0.95))
+    for copy in (
+        _committed_transcript("ein Haus kaufen können.", with_timestamps=True),
+        _committed_transcript("ein Haus kaufen können."),
+    ):
+        stream._process_stream_event(copy)
+
+    assert _event_types(stream)[-2:] == [_TURN.FINAL_TRANSCRIPT, _TURN.END_OF_SPEECH]
+
+
+def test_a_forced_commit_changes_nothing_for_manual_commits() -> None:
+    stream = _mid_speech_stream(commit_strategy="manual")
+
+    stream._process_stream_event(_committed_transcript("bevor sie überhaupt"))
+
+    assert _event_types(stream)[-1] == _TURN.FINAL_TRANSCRIPT
+    assert stream._speaking is True
+    # the caller's own flush ends a manual turn, nothing is left to watch for
+    assert stream._forced_commit_deadline is None
+
+
+def test_a_forced_commit_is_logged(caplog: pytest.LogCaptureFixture) -> None:
+    stream = _mid_speech_stream()
+
+    with caplog.at_level(logging.DEBUG, logger="livekit.plugins.elevenlabs"):
+        stream._process_stream_event(_committed_transcript("bevor sie überhaupt"))
+
+    records = [r for r in caplog.records if "forced a commit" in r.getMessage()]
+    assert len(records) == 1
+    assert records[0].levelno == logging.DEBUG
+    assert records[0].__dict__["uncommitted_audio"] == 35.0
+    assert records[0].__dict__["turn_probability"] == 0.02
+
+
+async def _forced_commit_on(stream: elevenlabs_stt.SpeechStream, ws: _FakeWS) -> None:
+    """Bring a live stream to a forced commit: 35s into a segment, mid-sentence."""
+    await _send_audio(stream, ws, _MIN_COMMIT_MS)
+    stream._uncommitted_samples = _FORCED_AUDIO_SAMPLES
+    await _receive(
+        ws,
+        _turn_partial("bevor sie überhaupt", 0.02),
+        _committed_transcript("bevor sie überhaupt", with_timestamps=True),
+        _committed_transcript("bevor sie überhaupt"),
+    )
+
+
+def _watch(stream: elevenlabs_stt.SpeechStream) -> tuple[list[Any], asyncio.Task[None]]:
+    events: list[Any] = []
+
+    async def _read() -> None:
+        async for event in stream:
+            if event.type != _TURN.RECOGNITION_USAGE:
+                events.append(event.type)
+
+    return events, asyncio.create_task(_read())
+
+
+async def test_a_turn_left_open_by_a_forced_commit_ends_when_no_speech_follows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Scribe sends nothing after a forced commit when the speaker stopped right at it: no
+    # silence commit, no empty one. Without this the turn would stay open for good.
+    monkeypatch.setattr(elevenlabs_stt, "_FORCED_COMMIT_MIN_WAIT", 0.05)
+    ws = _FakeWS()
+    stream = _live_stream(
+        ws,
+        model="scribe_v3_live",
+        commit_strategy="turn_prediction",
+        server_vad={"vad_silence_threshold_secs": 0.05},
+    )
+    events, reader = _watch(stream)
+    try:
+        await _forced_commit_on(stream, ws)
+        await _wait_until(lambda: len(events) == 4)
+
+        assert events == [
+            _TURN.START_OF_SPEECH,
+            _TURN.INTERIM_TRANSCRIPT,
+            _TURN.FINAL_TRANSCRIPT,
+            _TURN.END_OF_SPEECH,
+        ]
+        assert stream._speaking is False
+    finally:
+        await stream.aclose()
+        reader.cancel()
+
+
+async def test_the_silence_threshold_is_waited_for_before_ending_that_turn() -> None:
+    ws = _FakeWS()
+    stream = _live_stream(
+        ws,
+        model="scribe_v3_live",
+        commit_strategy="turn_prediction",
+        server_vad={"vad_silence_threshold_secs": 2.5},
+    )
+    events, reader = _watch(stream)
+    try:
+        before = time.monotonic()
+        await _forced_commit_on(stream, ws)
+
+        assert stream._forced_commit_deadline is not None
+        assert 2.3 < stream._forced_commit_deadline - before < 2.8
+        assert events[-1] == _TURN.FINAL_TRANSCRIPT
+    finally:
+        await stream.aclose()
+        reader.cancel()
+
+
+async def test_speech_after_a_forced_commit_leaves_the_turn_to_the_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(elevenlabs_stt, "_FORCED_COMMIT_MIN_WAIT", 0.05)
+    ws = _FakeWS()
+    stream = _live_stream(
+        ws,
+        model="scribe_v3_live",
+        commit_strategy="turn_prediction",
+        server_vad={"vad_silence_threshold_secs": 0.05},
+    )
+    events, reader = _watch(stream)
+    try:
+        await _send_audio(stream, ws, _MIN_COMMIT_MS)
+        stream._uncommitted_samples = _FORCED_AUDIO_SAMPLES
+        # the next segment's first partial arrives with the commit, before the wait is over
+        await _receive(
+            ws,
+            _turn_partial("bevor sie überhaupt", 0.02),
+            _committed_transcript("bevor sie überhaupt", with_timestamps=True),
+            _committed_transcript("bevor sie überhaupt"),
+            _turn_partial("ein Haus", 0.01),
+        )
+        await asyncio.sleep(0.15)
+
+        assert stream._forced_commit_deadline is None
+        assert events == [
+            _TURN.START_OF_SPEECH,
+            _TURN.INTERIM_TRANSCRIPT,
+            _TURN.FINAL_TRANSCRIPT,
+            _TURN.INTERIM_TRANSCRIPT,
+        ]
+
+        await _receive(
+            ws,
+            _turn_partial("ein Haus kaufen können.", 0.95),
+            _committed_transcript("ein Haus kaufen können.", with_timestamps=True),
+            _committed_transcript("ein Haus kaufen können."),
+        )
+        await _wait_until(lambda: events[-1] == _TURN.END_OF_SPEECH)
+        assert events.count(_TURN.END_OF_SPEECH) == 1
+        assert events.count(_TURN.FINAL_TRANSCRIPT) == 2
+    finally:
+        await stream.aclose()
+        reader.cancel()
+
+
+async def test_a_reconnect_does_not_leave_that_turn_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(elevenlabs_stt, "_FORCED_COMMIT_MIN_WAIT", 0.3)
+    ws = _FakeWS()
+    stream = _live_stream(
+        ws,
+        model="scribe_v3_live",
+        commit_strategy="turn_prediction",
+        server_vad={"vad_silence_threshold_secs": 0.3},
+    )
+    events, reader = _watch(stream)
+    try:
+        await _forced_commit_on(stream, ws)
+        assert events[-1] == _TURN.FINAL_TRANSCRIPT
+
+        stream.update_options(no_verbatim=True)
+
+        await _wait_until(lambda: events[-1] == _TURN.END_OF_SPEECH)
+    finally:
+        await stream.aclose()
+        reader.cancel()
+
+
+async def test_the_answer_to_a_flush_is_not_taken_for_a_forced_commit() -> None:
+    ws = _FakeWS()
+    stream = _live_stream(ws, model="scribe_v3_live", commit_strategy="turn_prediction")
+    events, reader = _watch(stream)
+    try:
+        await _send_audio(stream, ws, _MIN_COMMIT_MS)
+        await _receive(ws, _turn_partial("bevor sie überhaupt", 0.02))
+        stream.flush()
+        await _wait_until(lambda: _commits(ws) == 1)
+        # as much audio as a forced commit has behind it, but the commit was ours
+        stream._uncommitted_samples = _FORCED_AUDIO_SAMPLES
+        await _receive(
+            ws,
+            _committed_transcript("bevor sie überhaupt", with_timestamps=True),
+            _committed_transcript("bevor sie überhaupt"),
+        )
+
+        assert events[-2:] == [_TURN.FINAL_TRANSCRIPT, _TURN.END_OF_SPEECH]
+    finally:
+        await stream.aclose()
+        reader.cancel()
