@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import math
 import os
@@ -103,6 +104,10 @@ silence, or `turn_prediction` when the model predicts the end of the user's turn
 
 _COMMIT_STRATEGIES: tuple[STTCommitStrategy, ...] = ("manual", "vad", "turn_prediction")
 
+# How long a flush waits for the answer to a commit already on its way. Scribe answers within
+# about 0.2s; past this the flush commits anyway rather than hold the caller's final transcript.
+_COMMIT_ANSWER_TIMEOUT = 1.0
+
 
 def _resolve_commit_strategy(
     commit_strategy: NotGivenOr[STTCommitStrategy],
@@ -134,6 +139,7 @@ class STTOptions:
     audio_chunk_duration_ms: int = 50
     commit_strategy: NotGivenOr[STTCommitStrategy] = NOT_GIVEN
     multilang_mode: bool = False
+    turn_probability_threshold: NotGivenOr[float] = NOT_GIVEN
 
 
 class STT(stt.STT):
@@ -160,6 +166,7 @@ class STT(stt.STT):
         previous_text: NotGivenOr[str] = NOT_GIVEN,
         commit_strategy: NotGivenOr[STTCommitStrategy] = NOT_GIVEN,
         multilang_mode: bool = False,
+        turn_probability_threshold: NotGivenOr[float] = NOT_GIVEN,
     ) -> None:
         """
         Create a new instance of ElevenLabs STT.
@@ -214,6 +221,13 @@ class STT(stt.STT):
             multilang_mode (bool): Transcribe every language spoken in its own script, following
                 speakers who switch languages mid-sentence. Only supported for Scribe v3 Live.
                 Default is False.
+            turn_probability_threshold (NotGivenOr[float]): End the user's turn when the model's
+                `turn_probability` for the current transcript reaches this value, greater than 0
+                and at most 1. "turn_prediction" does the same on the server at a fixed 0.9; with
+                this option the plugin sends the commit itself, so the value can be chosen. The
+                session is opened with the "vad" commit strategy, whatever `commit_strategy`
+                says, so the server still commits after the `server_vad` silence threshold when
+                the probability never gets there. Only supported for Scribe v3 Live.
         """
 
         if (
@@ -294,6 +308,32 @@ class STT(stt.STT):
             )
             multilang_mode = False
 
+        if is_given(turn_probability_threshold):
+            if (
+                isinstance(turn_probability_threshold, bool)
+                or not isinstance(turn_probability_threshold, (int, float))
+                or not 0 < turn_probability_threshold <= 1
+            ):
+                raise ValueError(
+                    "turn_probability_threshold must be greater than 0 and at most 1, "
+                    f"got {turn_probability_threshold!r}"
+                )
+
+            if model not in _TURN_PREDICTION_MODELS:
+                logger.warning(
+                    "`turn_probability_threshold` is only supported for Scribe v3 Live "
+                    "and will be ignored"
+                )
+                turn_probability_threshold = NOT_GIVEN
+            else:
+                if is_given(commit_strategy) and commit_strategy != "vad":
+                    logger.warning(
+                        "`turn_probability_threshold` takes precedence over `commit_strategy`: "
+                        "the session uses `vad` and the plugin commits at the threshold"
+                    )
+                # the plugin commits at the threshold, the server after a silence
+                commit_strategy = "vad"
+
         super().__init__(
             capabilities=STTCapabilities(
                 streaming=use_realtime,
@@ -332,6 +372,7 @@ class STT(stt.STT):
             previous_text=resolved_previous_text,
             commit_strategy=commit_strategy,
             multilang_mode=multilang_mode,
+            turn_probability_threshold=turn_probability_threshold,
         )
         self._session = http_session
         self._streams = weakref.WeakSet[SpeechStream]()
@@ -555,6 +596,14 @@ class SpeechStream(stt.SpeechStream):
         self._speaking = False  # Track if we're currently in a speech segment
         self._last_partial_text = ""
         self._final_alternatives: list[SpeechData] = []
+        # Scribe closes the session on a commit with less than 0.3s of audio since the
+        # previous commit or the connect
+        self._min_commit_samples = opts.sample_rate * 3 // 10
+        # audio sent on this connection since the last commit
+        self._uncommitted_samples = 0
+        # a commit of ours the server has not answered yet (`turn_probability_threshold` only)
+        self._commit_pending = False
+        self._commit_answered = asyncio.Event()
         self._audio_duration_collector = PeriodicCollector(
             callback=self._on_audio_duration_report,
             duration=5.0,
@@ -663,51 +712,51 @@ class SpeechStream(stt.SpeechStream):
                 samples_per_channel=samples_per_chunk,
             )
 
-            # Scribe closes the session on a commit with less than 0.3s of audio since the
-            # previous commit or the connect
-            min_commit_samples = self._opts.sample_rate * 3 // 10
-            uncommitted_samples = 0
+            async def send_audio(frame: rtc.AudioFrame) -> None:
+                self._audio_duration_collector.push(frame.duration)
+                audio_b64 = base64.b64encode(frame.data.tobytes()).decode("utf-8")
+                await ws.send_str(
+                    json.dumps(
+                        {
+                            "message_type": "input_audio_chunk",
+                            "audio_base_64": audio_b64,
+                            "commit": False,
+                            "sample_rate": self._opts.sample_rate,
+                        }
+                    )
+                )
+                self._uncommitted_samples += frame.samples_per_channel
+
             has_ended = False
             try:
                 async for data in self._input_ch:
                     # Write audio bytes to the buffer and get complete chunks
                     frames: list[rtc.AudioFrame] = []
                     if isinstance(data, rtc.AudioFrame):
-                        uncommitted_samples += data.samples_per_channel
                         frames.extend(audio_bstream.write(data.data.tobytes()))
                     elif isinstance(data, self._FlushSentinel):
                         frames.extend(audio_bstream.flush())
-                        if (missing := min_commit_samples - uncommitted_samples) > 0:
-                            frames.append(rtc.AudioFrame.create(self._opts.sample_rate, 1, missing))
                         has_ended = True
 
                     for frame in frames:
-                        self._audio_duration_collector.push(frame.duration)
-                        audio_b64 = base64.b64encode(frame.data.tobytes()).decode("utf-8")
-                        await ws.send_str(
-                            json.dumps(
-                                {
-                                    "message_type": "input_audio_chunk",
-                                    "audio_base_64": audio_b64,
-                                    "commit": False,
-                                    "sample_rate": self._opts.sample_rate,
-                                }
-                            )
-                        )
+                        await send_audio(frame)
 
                     if has_ended:
-                        self._audio_duration_collector.flush()
-                        await ws.send_str(
-                            json.dumps(
-                                {
-                                    "message_type": "input_audio_chunk",
-                                    "audio_base_64": "",
-                                    "commit": True,
-                                    "sample_rate": self._opts.sample_rate,
-                                }
+                        if self._commit_pending:
+                            # Scribe counts the audio from where it finished our last commit,
+                            # so one sent before its answer is throttled whatever is padded
+                            with contextlib.suppress(asyncio.TimeoutError):
+                                await asyncio.wait_for(
+                                    self._commit_answered.wait(), _COMMIT_ANSWER_TIMEOUT
+                                )
+                        # counted only now: a commit at the turn probability threshold can
+                        # start the count over while the audio above is still going out
+                        if (missing := self._min_commit_samples - self._uncommitted_samples) > 0:
+                            await send_audio(
+                                rtc.AudioFrame.create(self._opts.sample_rate, 1, missing)
                             )
-                        )
-                        uncommitted_samples = 0
+                        self._audio_duration_collector.flush()
+                        await self._send_commit(ws)
                         has_ended = False
 
                 closing_ws = True
@@ -746,6 +795,8 @@ class SpeechStream(stt.SpeechStream):
                 try:
                     parsed = json.loads(msg.data)
                     self._process_stream_event(parsed)
+                    if is_given(self._opts.turn_probability_threshold):
+                        await self._commit_on_turn_probability(ws, parsed)
                     if parsed.get("message_type") in (
                         "partial_transcript",
                         "committed_transcript",
@@ -765,6 +816,8 @@ class SpeechStream(stt.SpeechStream):
                 self._input_ch.restart_provider_clock()
                 self._last_partial_text = ""
                 self._final_alternatives = []
+                self._uncommitted_samples = 0
+                self._commit_pending = False
                 if self._opts.previous_text:
                     # Must be the first input_audio_chunk on the connection.
                     await ws.send_str(
@@ -807,6 +860,69 @@ class SpeechStream(stt.SpeechStream):
             finally:
                 if ws is not None:
                     await ws.close()
+
+    async def _send_commit(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        """Commit the audio sent so far. The count starts over before the send, so nothing
+        that runs while it is on its way commits a second time."""
+        self._uncommitted_samples = 0
+        if is_given(self._opts.turn_probability_threshold):
+            self._commit_pending = True
+            self._commit_answered.clear()
+        await ws.send_str(
+            json.dumps(
+                {
+                    "message_type": "input_audio_chunk",
+                    "audio_base_64": "",
+                    "commit": True,
+                    "sample_rate": self._opts.sample_rate,
+                }
+            )
+        )
+
+    async def _commit_on_turn_probability(
+        self, ws: aiohttp.ClientWebSocketResponse, data: dict
+    ) -> None:
+        """End the turn ourselves once the model is sure enough that the speaker has finished.
+
+        Partials keep arriving until the commit is answered, so only one goes out per segment,
+        and never with less audio behind it than Scribe accepts."""
+        message_type = data.get("message_type")
+        if message_type in ("committed_transcript", "committed_transcript_with_timestamps"):
+            # a commit was finished, ours or the server's own after a silence: Scribe counts
+            # the uncommitted audio from here
+            self._uncommitted_samples = 0
+            self._commit_pending = False
+            self._commit_answered.set()
+            return
+
+        if message_type != "partial_transcript" or not data.get("text"):
+            return
+
+        threshold = self._opts.turn_probability_threshold
+        probability = data.get("turn_probability")
+        if (
+            not is_given(threshold)
+            or isinstance(probability, bool)
+            or not isinstance(probability, (int, float))
+            or probability < threshold
+        ):
+            return
+
+        if self._commit_pending or self._uncommitted_samples < self._min_commit_samples:
+            # a later partial commits once the answer or enough audio is in
+            return
+
+        logger.debug(
+            "committing the turn at turn_probability %.2f (threshold %.2f)",
+            probability,
+            threshold,
+            extra={"turn_probability": probability, "turn_probability_threshold": threshold},
+        )
+        try:
+            await self._send_commit(ws)
+        except (aiohttp.ClientError, ConnectionError):
+            # the socket is going away; the receive loop reports it
+            self._commit_pending = False
 
     async def _connect_ws(self) -> aiohttp.ClientWebSocketResponse:
         """Establish WebSocket connection to the ElevenLabs Scribe realtime API"""

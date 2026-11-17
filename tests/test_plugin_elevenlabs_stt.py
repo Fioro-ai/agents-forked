@@ -614,7 +614,8 @@ class _FakeWS:
 
 def _live_stream(ws: _FakeWS, **kwargs: Any) -> elevenlabs_stt.SpeechStream:
     """A real SpeechStream running its real _run loop against a fake socket."""
-    instance = elevenlabs_stt.STT(api_key="test-key", model="scribe_v2_realtime", **kwargs)
+    kwargs.setdefault("model", "scribe_v2_realtime")
+    instance = elevenlabs_stt.STT(api_key="test-key", **kwargs)
     opts = dataclasses.replace(instance._opts)
     stream = elevenlabs_stt.SpeechStream(
         stt=instance,
@@ -1153,3 +1154,383 @@ def test_server_vad_updates_keep_an_explicit_commit_strategy() -> None:
     instance.update_options(server_vad=None)
     assert instance.capabilities.manual_flush is False
     assert _stream_of(instance)._commit_strategy == "turn_prediction"
+
+
+# --- Scribe v3 Live: turn end at a caller-chosen turn probability
+
+
+def _turn_partial(text: str, probability: float | None) -> dict:
+    message: dict = {"message_type": "partial_transcript", "text": text}
+    if probability is not None:
+        message["turn_probability"] = probability
+    return message
+
+
+def _commits(ws: _FakeWS) -> int:
+    return sum(msg["commit"] for msg in ws.sent)
+
+
+def _threshold_stream(
+    ws: _FakeWS, threshold: float = 0.93, **kwargs: Any
+) -> elevenlabs_stt.SpeechStream:
+    return _live_stream(ws, model="scribe_v3_live", turn_probability_threshold=threshold, **kwargs)
+
+
+async def _send_audio(stream: elevenlabs_stt.SpeechStream, ws: _FakeWS, ms: int) -> None:
+    """Push audio and wait until all of it went out (a whole number of 50ms chunks)."""
+    expected = len(ws.sent) + ms // 50
+    stream.push_frame(_frame(ms))
+    await _wait_until(lambda: len(ws.sent) == expected)
+
+
+async def _receive(ws: _FakeWS, *messages: dict) -> None:
+    """Hand the stream server messages and wait until it has dealt with them."""
+    for message in messages:
+        ws.received.put_nowait(message)
+    await _wait_until(ws.received.empty)
+    for _ in range(5):
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.parametrize("threshold", [0, -0.1, 1.01, 93, True, "0.93", None])
+def test_an_invalid_turn_probability_threshold_is_rejected(threshold: Any) -> None:
+    with pytest.raises(ValueError, match="turn_probability_threshold must be greater than 0"):
+        elevenlabs_stt.STT(
+            api_key="test-key", model="scribe_v3_live", turn_probability_threshold=threshold
+        )
+
+
+@pytest.mark.parametrize("threshold", [0.5, 0.93, 1, 1.0])
+def test_a_valid_turn_probability_threshold_is_kept(threshold: float) -> None:
+    instance = elevenlabs_stt.STT(
+        api_key="test-key", model="scribe_v3_live", turn_probability_threshold=threshold
+    )
+
+    assert instance._opts.turn_probability_threshold == threshold
+
+
+async def test_the_threshold_opens_the_session_with_server_vad(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # the server's silence commit stays the fallback for a turn that never gets there
+    with caplog.at_level("WARNING"):
+        instance = elevenlabs_stt.STT(
+            api_key="test-key",
+            model="scribe_v3_live",
+            turn_probability_threshold=0.93,
+            server_vad={"vad_silence_threshold_secs": 0.6},
+        )
+    query = URL(await _connect_ws_url(_stream_of(instance))).query
+
+    assert query["commit_strategy"] == "vad"
+    assert query["vad_silence_threshold_secs"] == "0.6"
+    assert "turn_probability_threshold" not in query
+    assert instance.capabilities.manual_flush is False
+    assert caplog.text == ""
+
+
+@pytest.mark.parametrize("commit_strategy", ["turn_prediction", "manual"])
+async def test_the_threshold_takes_precedence_over_another_commit_strategy(
+    commit_strategy: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING"):
+        query = await _realtime_query(
+            model="scribe_v3_live",
+            turn_probability_threshold=0.93,
+            commit_strategy=commit_strategy,
+        )
+
+    assert "`turn_probability_threshold` takes precedence over `commit_strategy`" in caplog.text
+    assert query["commit_strategy"] == "vad"
+
+
+async def test_the_threshold_and_an_explicit_vad_strategy_agree(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING"):
+        query = await _realtime_query(
+            model="scribe_v3_live", turn_probability_threshold=0.93, commit_strategy="vad"
+        )
+
+    assert caplog.text == ""
+    assert query["commit_strategy"] == "vad"
+
+
+@pytest.mark.parametrize("model", ["scribe_v2_realtime", "scribe_v3", "scribe_v2"])
+def test_the_threshold_is_ignored_for_other_models(
+    model: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING"):
+        instance = elevenlabs_stt.STT(
+            api_key="test-key", model=model, turn_probability_threshold=0.93
+        )
+
+    assert "`turn_probability_threshold` is only supported for Scribe v3 Live" in caplog.text
+    assert instance._opts.turn_probability_threshold is NOT_GIVEN
+    # the session keeps the strategy it would have had without the option
+    assert instance._opts.commit_strategy is NOT_GIVEN
+    assert instance.capabilities.manual_flush is (model == "scribe_v2_realtime")
+
+
+def test_server_vad_updates_keep_the_threshold_s_strategy() -> None:
+    instance = elevenlabs_stt.STT(
+        api_key="test-key", model="scribe_v3_live", turn_probability_threshold=0.93
+    )
+
+    instance.update_options(server_vad=None)
+
+    assert instance.capabilities.manual_flush is False
+    assert _stream_of(instance)._commit_strategy == "vad"
+
+
+async def test_a_partial_at_the_threshold_commits_the_turn_once() -> None:
+    ws = _FakeWS()
+    stream = _threshold_stream(ws)
+    try:
+        await _send_audio(stream, ws, _MIN_COMMIT_MS)
+        await _receive(ws, _turn_partial("Ja, genau.", 0.93))
+
+        assert _commits(ws) == 1
+        assert ws.sent[-1] == {
+            "message_type": "input_audio_chunk",
+            "audio_base_64": "",
+            "commit": True,
+            "sample_rate": 16000,
+        }
+
+        # partials keep coming, also during silence, until the commit is answered
+        await _send_audio(stream, ws, 2 * _MIN_COMMIT_MS)
+        await _receive(ws, *[_turn_partial("Ja, genau.", 0.97)] * 3)
+
+        assert _commits(ws) == 1
+    finally:
+        await stream.aclose()
+
+
+@pytest.mark.parametrize(
+    "partial",
+    [
+        _turn_partial("Ja, genau.", 0.92),
+        _turn_partial("", 0.99),
+        _turn_partial("Ja, genau.", None),
+        {"message_type": "partial_transcript", "text": "Ja.", "turn_probability": "0.99"},
+    ],
+)
+async def test_a_partial_that_does_not_qualify_commits_nothing(partial: dict) -> None:
+    ws = _FakeWS()
+    stream = _threshold_stream(ws)
+    try:
+        await _send_audio(stream, ws, _MIN_COMMIT_MS)
+        await _receive(ws, partial)
+
+        assert _commits(ws) == 0
+    finally:
+        await stream.aclose()
+
+
+async def test_the_threshold_commit_waits_for_the_minimum_audio() -> None:
+    # Scribe answers a commit with less than 300ms of audio behind it with commit_throttled
+    # and closes the session
+    ws = _FakeWS()
+    stream = _threshold_stream(ws)
+    try:
+        await _send_audio(stream, ws, _MIN_COMMIT_MS - 100)
+        await _receive(ws, _turn_partial("Ja.", 0.99))
+        assert _commits(ws) == 0
+
+        await _send_audio(stream, ws, 100)
+        await _receive(ws, _turn_partial("Ja.", 0.99))
+        assert _commits(ws) == 1
+        assert _audio_ms_before_each_commit(ws.sent) == [_MIN_COMMIT_MS]
+    finally:
+        await stream.aclose()
+
+
+async def test_the_minimum_audio_is_counted_from_the_answer_to_the_last_commit() -> None:
+    # Scribe counts the uncommitted audio from where it finished a commit, not from where the
+    # client sent it: 350ms sent after a commit was measured as 0.20s against the live API
+    ws = _FakeWS()
+    stream = _threshold_stream(ws)
+    try:
+        await _send_audio(stream, ws, _MIN_COMMIT_MS)
+        await _receive(ws, _turn_partial("Ja, genau.", 0.95))
+        assert _commits(ws) == 1
+
+        # sent while the commit is unanswered: none of it counts
+        await _send_audio(stream, ws, _MIN_COMMIT_MS)
+        await _receive(ws, _committed_transcript("Ja, genau."), _turn_partial("Und", 0.95))
+        assert _commits(ws) == 1
+
+        await _send_audio(stream, ws, _MIN_COMMIT_MS - 100)
+        await _receive(ws, _turn_partial("Und dann?", 0.95))
+        assert _commits(ws) == 1
+
+        await _send_audio(stream, ws, 100)
+        await _receive(ws, _turn_partial("Und dann?", 0.95))
+        assert _commits(ws) == 2
+    finally:
+        await stream.aclose()
+
+
+async def test_the_server_s_own_commit_starts_the_count_over() -> None:
+    ws = _FakeWS()
+    stream = _threshold_stream(ws)
+    try:
+        await _send_audio(stream, ws, 2 * _MIN_COMMIT_MS)
+        # the silence fallback committed first; the partial behind it must not commit again
+        await _receive(ws, _committed_transcript("Ja, genau."), _turn_partial("Ja", 0.99))
+
+        assert _commits(ws) == 0
+    finally:
+        await stream.aclose()
+
+
+async def _events_of(stream: elevenlabs_stt.SpeechStream) -> list[stt.SpeechEventType]:
+    events: list[stt.SpeechEventType] = []
+    async for event in stream:
+        if event.type != stt.SpeechEventType.RECOGNITION_USAGE:
+            events.append(event.type)
+    return events
+
+
+async def test_the_threshold_commit_ends_the_turn_once() -> None:
+    ws = _FakeWS()
+    stream = _threshold_stream(ws)
+    reader = asyncio.create_task(_events_of(stream))
+    try:
+        await _send_audio(stream, ws, _MIN_COMMIT_MS)
+        await _receive(ws, _turn_partial("Ja, genau.", 0.95))
+        assert _commits(ws) == 1
+
+        # Scribe sends both copies of a commit; then the empty one of a second commit that
+        # crossed ours on the wire, as the server's silence commit does
+        await _receive(
+            ws,
+            _committed_transcript("Ja, genau.", with_timestamps=True),
+            _committed_transcript("Ja, genau."),
+            _committed_transcript("", with_timestamps=True),
+            _committed_transcript(""),
+        )
+    finally:
+        await stream.aclose()
+
+    assert await reader == [
+        stt.SpeechEventType.START_OF_SPEECH,
+        stt.SpeechEventType.INTERIM_TRANSCRIPT,
+        stt.SpeechEventType.FINAL_TRANSCRIPT,
+        stt.SpeechEventType.END_OF_SPEECH,
+    ]
+
+
+async def test_a_second_turn_on_the_same_connection_is_committed_too() -> None:
+    ws = _FakeWS()
+    stream = _threshold_stream(ws)
+    reader = asyncio.create_task(_events_of(stream))
+    try:
+        for text in ("Ja, genau.", "Und dann?"):
+            await _send_audio(stream, ws, _MIN_COMMIT_MS)
+            await _receive(ws, _turn_partial(text, 0.95))
+            await _receive(
+                ws,
+                _committed_transcript(text, with_timestamps=True),
+                _committed_transcript(text),
+            )
+
+        assert _commits(ws) == 2
+    finally:
+        await stream.aclose()
+
+    turn = [
+        stt.SpeechEventType.START_OF_SPEECH,
+        stt.SpeechEventType.INTERIM_TRANSCRIPT,
+        stt.SpeechEventType.FINAL_TRANSCRIPT,
+        stt.SpeechEventType.END_OF_SPEECH,
+    ]
+    assert await reader == turn + turn
+
+
+async def test_no_threshold_leaves_the_commits_to_the_server() -> None:
+    ws = _FakeWS()
+    stream = _live_stream(ws, model="scribe_v3_live", commit_strategy="turn_prediction")
+    try:
+        await _send_audio(stream, ws, _MIN_COMMIT_MS)
+        await _receive(ws, _turn_partial("Ja, genau.", 0.99))
+
+        assert _commits(ws) == 0
+    finally:
+        await stream.aclose()
+
+
+async def test_the_threshold_commit_is_logged_for_tuning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    ws = _FakeWS()
+    stream = _threshold_stream(ws, threshold=0.93)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="livekit.plugins.elevenlabs"):
+            await _send_audio(stream, ws, _MIN_COMMIT_MS)
+            await _receive(ws, _turn_partial("Ja, genau.", 0.96))
+    finally:
+        await stream.aclose()
+
+    records = [r for r in caplog.records if "committing the turn" in r.getMessage()]
+    assert len(records) == 1
+    assert records[0].levelno == logging.DEBUG
+    assert records[0].__dict__["turn_probability"] == 0.96
+    assert records[0].__dict__["turn_probability_threshold"] == 0.93
+
+
+async def test_a_flush_waits_for_the_answer_to_a_threshold_commit() -> None:
+    # a commit sent before the previous one is answered is throttled, and the session closed
+    # with it takes the previous commit's transcript along
+    ws = _FakeWS()
+    stream = _threshold_stream(ws)
+    try:
+        await _send_audio(stream, ws, _MIN_COMMIT_MS)
+        await _receive(ws, _turn_partial("Ja, genau.", 0.95))
+        assert _commits(ws) == 1
+
+        stream.flush()
+        await _receive(ws)
+        assert _commits(ws) == 1
+
+        await _receive(ws, _committed_transcript("Ja, genau."))
+        await _wait_until(lambda: _commits(ws) == 2)
+        assert _audio_ms_before_each_commit(ws.sent) == [_MIN_COMMIT_MS, _MIN_COMMIT_MS]
+    finally:
+        await stream.aclose()
+
+
+async def test_a_flush_does_not_wait_forever_for_that_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(elevenlabs_stt, "_COMMIT_ANSWER_TIMEOUT", 0.05)
+    ws = _FakeWS()
+    stream = _threshold_stream(ws)
+    try:
+        await _send_audio(stream, ws, _MIN_COMMIT_MS)
+        await _receive(ws, _turn_partial("Ja, genau.", 0.95))
+
+        stream.flush()
+        await _wait_until(lambda: _commits(ws) == 2)
+    finally:
+        await stream.aclose()
+
+
+async def test_a_reconnect_forgets_an_unanswered_commit() -> None:
+    ws = _FakeWS()
+    stream = _threshold_stream(ws)
+    try:
+        await _send_audio(stream, ws, _MIN_COMMIT_MS)
+        await _receive(ws, _turn_partial("Ja, genau.", 0.95))
+        assert _commits(ws) == 1
+
+        # the answer never comes: the connection is replaced
+        stream.update_options(no_verbatim=True)
+        await _receive(ws)
+
+        await _send_audio(stream, ws, _MIN_COMMIT_MS)
+        await _receive(ws, _turn_partial("Und dann?", 0.95))
+        assert _commits(ws) == 2
+    finally:
+        await stream.aclose()
