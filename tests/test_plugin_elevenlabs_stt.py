@@ -1139,6 +1139,40 @@ async def test_multilingual_mode_is_ignored_for_other_models(
     assert "multilang_mode" not in query
 
 
+async def test_background_audio_filter_is_requested_when_enabled() -> None:
+    query = await _realtime_query(model="scribe_v3_live", filter_background_audio=True)
+
+    assert query["filter_background_audio"] == "true"
+
+
+async def test_background_audio_filter_is_off_by_default() -> None:
+    query = await _realtime_query(model="scribe_v3_live")
+
+    assert "filter_background_audio" not in query
+
+
+def test_background_audio_filter_is_ignored_for_batch_models(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING"):
+        instance = elevenlabs_stt.STT(
+            api_key="test-key", model="scribe_v3", filter_background_audio=True
+        )
+
+    assert instance._opts.filter_background_audio is False
+    assert "`filter_background_audio` is only supported for realtime models" in caplog.text
+
+
+def test_background_audio_filter_with_timestamps_is_rejected() -> None:
+    with pytest.raises(ValueError, match="cannot be combined with include_timestamps"):
+        elevenlabs_stt.STT(
+            api_key="test-key",
+            model="scribe_v3_live",
+            filter_background_audio=True,
+            include_timestamps=True,
+        )
+
+
 @pytest.mark.parametrize(
     ("kwargs", "manual_flush"),
     [

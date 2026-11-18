@@ -157,6 +157,7 @@ class STTOptions:
     commit_strategy: NotGivenOr[STTCommitStrategy] = NOT_GIVEN
     multilang_mode: bool = False
     turn_probability_threshold: NotGivenOr[float] = NOT_GIVEN
+    filter_background_audio: bool = False
 
 
 class STT(stt.STT):
@@ -184,6 +185,7 @@ class STT(stt.STT):
         commit_strategy: NotGivenOr[STTCommitStrategy] = NOT_GIVEN,
         multilang_mode: bool = False,
         turn_probability_threshold: NotGivenOr[float] = NOT_GIVEN,
+        filter_background_audio: bool = False,
     ) -> None:
         """
         Create a new instance of ElevenLabs STT.
@@ -245,6 +247,10 @@ class STT(stt.STT):
                 session is opened with the "vad" commit strategy, whatever `commit_strategy`
                 says, so the server still commits after the `server_vad` silence threshold when
                 the probability never gets there. Only supported for Scribe v3 Live.
+            filter_background_audio (bool): Have the server's voice activity detection ignore
+                background speech, such as nearby conversations, and ambient noise, so they do
+                not open or end a turn. Cannot be combined with `include_timestamps`, the server
+                rejects the session. Only supported for realtime models. Default is False.
         """
 
         if (
@@ -325,6 +331,16 @@ class STT(stt.STT):
             )
             multilang_mode = False
 
+        if filter_background_audio and not use_realtime:
+            logger.warning(
+                "`filter_background_audio` is only supported for realtime models "
+                "and will be ignored"
+            )
+            filter_background_audio = False
+        elif filter_background_audio and include_timestamps:
+            # the server answers this combination with invalid_request and closes the session
+            raise ValueError("filter_background_audio cannot be combined with include_timestamps")
+
         if is_given(turn_probability_threshold):
             if (
                 isinstance(turn_probability_threshold, bool)
@@ -390,6 +406,7 @@ class STT(stt.STT):
             commit_strategy=commit_strategy,
             multilang_mode=multilang_mode,
             turn_probability_threshold=turn_probability_threshold,
+            filter_background_audio=filter_background_audio,
         )
         self._session = http_session
         self._streams = weakref.WeakSet[SpeechStream]()
@@ -1102,6 +1119,9 @@ class SpeechStream(stt.SpeechStream):
 
         if self._opts.multilang_mode:
             params.append("multilang_mode=true")
+
+        if self._opts.filter_background_audio:
+            params.append("filter_background_audio=true")
 
         if (server_vad := self._server_vad) is not None:
             if (
