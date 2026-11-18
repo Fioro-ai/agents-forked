@@ -46,7 +46,7 @@ from livekit.agents.utils import AudioBuffer, http_context, is_given
 from livekit.agents.voice.io import TimedString
 
 from ._utils import PeriodicCollector, trace_id_from_headers
-from .log import logger
+from .log import logger, turn_logger
 from .models import STTRealtimeSampleRates
 
 API_BASE_URL_V1 = "https://api.elevenlabs.io/v1"
@@ -621,6 +621,13 @@ class SpeechStream(stt.SpeechStream):
         # a commit of ours the server has not answered yet
         self._commit_pending = False
         self._commit_answered = asyncio.Event()
+        # why our pending commit went out ("turn_probability" or "flush"), with the turn
+        # probability and the seconds the partial text had stood still when it did
+        self._commit_reason: str | None = None
+        self._commit_probability: float | None = None
+        self._commit_text_age: float | None = None
+        # the reason of the commit the server answered last; None when it committed on its own
+        self._answered_commit_reason: str | None = None
         # what the last partial said about the turn, and when its text last moved: together
         # they tell a commit Scribe forced on running speech from one that ends a turn
         self._last_turn_probability: float | None = None
@@ -784,7 +791,7 @@ class SpeechStream(stt.SpeechStream):
                                 rtc.AudioFrame.create(self._opts.sample_rate, 1, missing)
                             )
                         self._audio_duration_collector.flush()
-                        await self._send_commit(ws)
+                        await self._send_commit(ws, reason="flush")
                         has_ended = False
 
                 closing_ws = True
@@ -857,6 +864,8 @@ class SpeechStream(stt.SpeechStream):
                 self._final_alternatives = []
                 self._uncommitted_samples = 0
                 self._commit_pending = False
+                self._commit_reason = None
+                self._answered_commit_reason = None
                 self._last_turn_probability = None
                 self._partial_text_changed_at = None
                 self._commit_copy_seen = None
@@ -904,11 +913,20 @@ class SpeechStream(stt.SpeechStream):
                 if ws is not None:
                     await ws.close()
 
-    async def _send_commit(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+    async def _send_commit(
+        self,
+        ws: aiohttp.ClientWebSocketResponse,
+        *,
+        reason: str,
+        probability: float | None = None,
+    ) -> None:
         """Commit the audio sent so far. The count starts over before the send, so nothing
         that runs while it is on its way commits a second time."""
         self._uncommitted_samples = 0
         self._commit_pending = True
+        self._commit_reason = reason
+        self._commit_probability = probability
+        self._commit_text_age = self._text_age()
         self._commit_answered.clear()
         await ws.send_str(
             json.dumps(
@@ -952,7 +970,7 @@ class SpeechStream(stt.SpeechStream):
             extra={"turn_probability": probability, "turn_probability_threshold": threshold},
         )
         try:
-            await self._send_commit(ws)
+            await self._send_commit(ws, reason="turn_probability", probability=probability)
         except (aiohttp.ClientError, ConnectionError):
             # the socket is going away; the receive loop reports it
             self._commit_pending = False
@@ -995,6 +1013,8 @@ class SpeechStream(stt.SpeechStream):
         self._commit_forced = forced
         self._commit_copy_seen = message_type if two_copies else None
         self._forced_commit_deadline = None
+        self._answered_commit_reason = self._commit_reason if self._commit_pending else None
+        self._commit_reason = None
         # a commit was finished, ours or the server's own: Scribe counts the uncommitted
         # audio from here
         self._uncommitted_samples = 0
@@ -1002,12 +1022,63 @@ class SpeechStream(stt.SpeechStream):
         self._commit_answered.set()
         return forced
 
+    def _text_age(self) -> float | None:
+        """Seconds since the partial text last changed, about how long the speaker had paused."""
+        changed_at = self._partial_text_changed_at
+        return None if changed_at is None else time.monotonic() - changed_at
+
+    def _log_turn_end(self, *, ended_by: str | None = None) -> None:
+        """One INFO line per ended turn: what ended it, at which turn probability and after how
+        long a pause, so a turn cut short can be told from one that ended on its own."""
+        reason = self._answered_commit_reason if ended_by is None else None
+        probability = (
+            self._commit_probability
+            if reason == "turn_probability"
+            else self._last_turn_probability
+        )
+        threshold = (
+            self._opts.turn_probability_threshold
+            if is_given(self._opts.turn_probability_threshold)
+            else _SERVER_TURN_PROBABILITY
+            if self._commit_strategy == "turn_prediction"
+            else None
+        )
+        if ended_by is None:
+            if reason is not None:
+                ended_by = reason
+            elif (
+                self._commit_strategy == "turn_prediction"
+                and probability is not None
+                and probability >= _SERVER_TURN_PROBABILITY
+            ):
+                # Scribe does not say why it committed; at its own threshold it was the prediction
+                ended_by = "turn_prediction"
+            else:
+                ended_by = "silence"
+        text_age = self._commit_text_age if reason is not None else self._text_age()
+
+        extra: dict[str, Any] = {"ended_by": ended_by}
+        if probability is not None:
+            extra["turn_probability"] = round(probability, 3)
+        if threshold is not None:
+            extra["turn_probability_threshold"] = threshold
+        if text_age is not None:
+            extra["text_stable_s"] = round(text_age, 2)
+        turn_logger.info(
+            "user turn ended by %s at turn_probability %s after %s s without new words",
+            ended_by,
+            extra.get("turn_probability"),
+            extra.get("text_stable_s"),
+            extra=extra,
+        )
+
     def _end_turn_after_forced_commit(self) -> None:
         self._forced_commit_deadline = None
         if not self._speaking:
             return
 
         logger.debug("no speech followed the forced commit, ending the turn")
+        self._log_turn_end(ended_by="silence_after_forced_commit")
         self._event_ch.send_nowait(
             stt.SpeechEvent(
                 type=SpeechEventType.END_OF_SPEECH,
@@ -1183,6 +1254,7 @@ class SpeechStream(stt.SpeechStream):
             if self._speaking and (
                 not text or (self._commit_strategy != "manual" and not forced_commit)
             ):
+                self._log_turn_end()
                 self._event_ch.send_nowait(
                     stt.SpeechEvent(
                         type=SpeechEventType.END_OF_SPEECH,

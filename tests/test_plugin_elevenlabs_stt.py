@@ -85,6 +85,10 @@ def _new_stream(
     stream._uncommitted_samples = 0
     stream._commit_pending = False
     stream._commit_answered = asyncio.Event()
+    stream._commit_reason = None
+    stream._commit_probability = None
+    stream._commit_text_age = None
+    stream._answered_commit_reason = None
     stream._last_turn_probability = None
     stream._partial_text_changed_at = None
     stream._commit_copy_seen = None
@@ -1489,6 +1493,83 @@ async def test_the_threshold_commit_is_logged_for_tuning(
     assert records[0].levelno == logging.DEBUG
     assert records[0].__dict__["turn_probability"] == 0.96
     assert records[0].__dict__["turn_probability_threshold"] == 0.93
+
+
+def _turn_ends(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == "livekit.plugins.elevenlabs.turns"]
+
+
+async def test_a_threshold_commit_logs_the_turn_end_at_the_probability_it_was_sent_at(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    ws = _FakeWS()
+    stream = _threshold_stream(ws, threshold=0.93)
+    try:
+        with caplog.at_level(logging.INFO, logger="livekit.plugins.elevenlabs.turns"):
+            await _send_audio(stream, ws, _MIN_COMMIT_MS)
+            await _receive(ws, _turn_partial("Also der Code nutzt ein super", 0.95))
+            # partials go on until the commit is answered; the log keeps the one that committed
+            await _receive(ws, _turn_partial("Also der Code nutzt ein super", 0.99))
+            await _receive(
+                ws,
+                _committed_transcript("Also der Code nutzt ein super", with_timestamps=True),
+                _committed_transcript("Also der Code nutzt ein super"),
+            )
+    finally:
+        await stream.aclose()
+
+    records = _turn_ends(caplog)
+    assert len(records) == 1
+    assert records[0].levelno == logging.INFO
+    assert records[0].__dict__["ended_by"] == "turn_probability"
+    assert records[0].__dict__["turn_probability"] == 0.95
+    assert records[0].__dict__["turn_probability_threshold"] == 0.93
+    assert records[0].__dict__["text_stable_s"] >= 0
+
+
+@pytest.mark.parametrize(
+    ("commit_strategy", "probability", "ended_by", "threshold"),
+    [
+        ("turn_prediction", 0.95, "turn_prediction", 0.9),
+        ("turn_prediction", 0.4, "silence", 0.9),
+        ("vad", 0.4, "silence", None),
+    ],
+)
+def test_the_server_s_own_commit_logs_what_ended_the_turn(
+    caplog: pytest.LogCaptureFixture,
+    commit_strategy: str,
+    probability: float,
+    ended_by: str,
+    threshold: float | None,
+) -> None:
+    stream = _new_stream(
+        model_id="scribe_v3_live", commit_strategy=commit_strategy, server_vad={}
+    )
+
+    with caplog.at_level(logging.INFO, logger="livekit.plugins.elevenlabs.turns"):
+        stream._process_stream_event(_turn_partial("Ja, genau.", probability))
+        stream._process_stream_event(_committed_transcript("Ja, genau."))
+
+    records = _turn_ends(caplog)
+    assert len(records) == 1
+    assert records[0].__dict__["ended_by"] == ended_by
+    assert records[0].__dict__["turn_probability"] == probability
+    assert records[0].__dict__.get("turn_probability_threshold") == threshold
+
+
+def test_a_forced_commit_logs_no_turn_end_until_the_turn_ends(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    stream = _mid_speech_stream()
+
+    with caplog.at_level(logging.INFO, logger="livekit.plugins.elevenlabs.turns"):
+        stream._process_stream_event(_committed_transcript("bevor sie überhaupt"))
+        assert _turn_ends(caplog) == []
+        stream._end_turn_after_forced_commit()
+
+    records = _turn_ends(caplog)
+    assert len(records) == 1
+    assert records[0].__dict__["ended_by"] == "silence_after_forced_commit"
 
 
 async def test_a_flush_waits_for_the_answer_to_a_threshold_commit() -> None:
